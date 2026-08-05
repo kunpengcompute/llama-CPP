@@ -1,0 +1,2657 @@
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 564af144..101997bf 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -148,6 +148,13 @@ target_include_directories(${TARGET} PUBLIC . ../vendor)
+ target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+ target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+ 
++if (GGML_OPENMP)
++    find_package(OpenMP)
++    if (OpenMP_FOUND)
++        target_link_libraries(${TARGET} PRIVATE OpenMP::OpenMP_CXX)
++    endif()
++endif()
++
+ 
+ #
+ # copy the license files
+diff --git a/common/common.cpp b/common/common.cpp
+index 4cc40ed8..3430ad95 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1346,6 +1346,7 @@ void common_embd_normalize(const float * inp, float * out, int n, int embd_norm)
+             sum = 1.0;
+             break;
+         case 0: // max absolute
++            #pragma omp simd reduction(max:sum)
+             for (int i = 0; i < n; i++) {
+                 if (sum < std::abs(inp[i])) {
+                     sum = std::abs(inp[i]);
+@@ -1354,8 +1355,9 @@ void common_embd_normalize(const float * inp, float * out, int n, int embd_norm)
+             sum /= 32760.0; // make an int16 range
+             break;
+         case 2: // euclidean
++            #pragma omp simd reduction(+:sum)
+             for (int i = 0; i < n; i++) {
+-                sum += inp[i] * inp[i];
++                sum += (double)inp[i] * inp[i];
+             }
+             sum = std::sqrt(sum);
+             break;
+@@ -1367,8 +1369,9 @@ void common_embd_normalize(const float * inp, float * out, int n, int embd_norm)
+             break;
+     }
+ 
+-    const float norm = sum > 0.0 ? 1.0 / sum : 0.0f;
++    const float norm = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
+ 
++    #pragma omp simd
+     for (int i = 0; i < n; i++) {
+         out[i] = inp[i] * norm;
+     }
+@@ -1379,10 +1382,11 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
+     double sum1 = 0.0;
+     double sum2 = 0.0;
+ 
++    #pragma omp simd reduction(+:sum,sum1,sum2)
+     for (int i = 0; i < n; i++) {
+-        sum  += embd1[i] * embd2[i];
+-        sum1 += embd1[i] * embd1[i];
+-        sum2 += embd2[i] * embd2[i];
++        sum  += (double)embd1[i] * embd2[i];
++        sum1 += (double)embd1[i] * embd1[i];
++        sum2 += (double)embd2[i] * embd2[i];
+     }
+ 
+     // Handle the case where one or both vectors are zero vectors
+diff --git a/compile.sh b/compile.sh
+index 3a926d09..cec41977 100755
+--- a/compile.sh
++++ b/compile.sh
+@@ -18,4 +18,4 @@ case $1 in
+             -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF
+     ;;
+ esac
+-cmake --build $1 --config release -j 20 
++cmake --build $1 --config release --target ggml-cpu llama-embedding llama-bench llama-server -j 20 
+diff --git a/ggml/src/ggml-cpu/fused-cpp/fp32_packqkv/fp32_packqkv_sdpa.cpp b/ggml/src/ggml-cpu/fused-cpp/fp32_packqkv/fp32_packqkv_sdpa.cpp
+index d29f9783..288e0e7d 100644
+--- a/ggml/src/ggml-cpu/fused-cpp/fp32_packqkv/fp32_packqkv_sdpa.cpp
++++ b/ggml/src/ggml-cpu/fused-cpp/fp32_packqkv/fp32_packqkv_sdpa.cpp
+@@ -1556,7 +1556,10 @@ void sdpa_fp32_packqkv_pbf16pv_strided_impl(
+   const bool has_mask =
+       mask32 != nullptr || mask_f16 != nullptr || mask_f32 != nullptr;
+   const bool pack_per_head =
+-      env_flag_enabled("FUSED_CPP_SDPA_PACK_PER_HEAD");
++    (cfg.B == 1 && cfg.N >= 4 && cfg.L >= 512 && cfg.S >= 512) ||
++    env_flag_enabled("FUSED_CPP_SDPA_PACK_PER_HEAD");
++  //  const bool pack_per_head =
++  //     env_flag_enabled("FUSED_CPP_SDPA_PACK_PER_HEAD");
+   if (pack_per_head) {
+     if (cfg.causal) {
+       if (has_mask) {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-quants.c b/ggml/src/ggml-cpu/ggml-cpu-quants.c
+index 8ab619d8..8e5af3e4 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-quants.c
++++ b/ggml/src/ggml-cpu/ggml-cpu-quants.c
+@@ -13,7 +13,8 @@
+ #include <float.h>
+ #include <stdlib.h> // for qsort
+ #include <stdio.h>  // for GGML_ASSERT
+-
++#include <time.h>
++#include <stdatomic.h>
+ #define GROUP_MAX_EPS 1e-15f
+ #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
+ #define GROUP_MAX_EPS_IQ2_S 1e-8f
+@@ -4390,14 +4391,15 @@ matmul_q8_0_mmla_spack_b(size_t na,
+ 
+     const size_t c_stride = c_column_bytes / sizeof(float32_t);
+ 
++    // 清零 C，后续 K 分块累加
++
+     for (size_t i = 0; i < N; ++i) {
+         for (size_t j = 0; j < M; ++j) {
+             C[i * c_stride + j] = 0.0f;
+         }
+     }
+-
+-    const size_t M_BLK = g_chunk_size_q8_0_mmla_spack / 8;
+-    const size_t N_BLK = g_chunk_size_q8_0_mmla_spack / 4;
++    const size_t M_BLK = 256; // 当前为 16
++    const size_t N_BLK = 64; // 当前为 32
+     const size_t K_BLK = 2048;
+ 
+     const size_t a_column_bytes = ggml_row_size(GGML_TYPE_Q8_0, K);
+@@ -4414,36 +4416,36 @@ matmul_q8_0_mmla_spack_b(size_t na,
+     float *tmp_c = NULL;
+     size_t tmp_c_cap = 0;
+ 
+-    for (size_t n = 0; n < N; n += N_BLK) {
+-        const size_t nb_cur = MIN(N_BLK, N - n);
+-
+-        for (size_t m = 0; m < M; m += M_BLK) {
+-            const size_t na_cur = MIN(M_BLK, M - m);
+-
+-            const bool use_8x8 = ((na_cur % 8) == 0) && ((nb_cur % 8) == 0);
+-
+-            if (use_8x8) {
+-                // 主路径：保留 K 分块
+-                for (size_t ki = 0; ki < K; ki += K_BLK) {
+-                    const size_t k  = MIN(K_BLK, K - ki);
+-                    const size_t kb = ki / QK8_0;
+-
+-                    matmul_q8_0_mmla_spack_padded(
+-                        true, na_cur, na_cur, (int)k,
+-                        &A[m * a_stride_q_0 + kb], a_column_bytes, &pack_a);
++    /*
++     * 新主循环：
++     *
++     * 原来是：
++     *   for n
++     *     for m
++     *       for ki
++     *         pack A
++     *         pack B
++     *
++     * 现在是：
++     *   for m
++     *     for ki
++     *       pack A once
++     *       for n
++     *         pack B
++     *
++     * 这样 -b512 下，同一个 A panel 不再被 16 个 N tile 重复 pack。
++     */
++    for (size_t m = 0; m < M; m += M_BLK) {
++        const size_t na_cur = MIN(M_BLK, M - m);
+ 
+-                    matmul_q8_0_mmla_spack_padded(
+-                        false, nb_cur, nb_cur, (int)k,
+-                        &B[n * b_stride_q_0 + kb], b_column_bytes, &pack_b);
++        /*
++         * 如果 M 方向不是 8 的倍数，直接对这个 m tile 的所有 n tile 走原来的 leftover 完整 K 路径。
++         * 这样可以避免在 K 分块循环里混入 full-K leftover，保证正确性。
++         */
++        if ((na_cur % 8) != 0) {
++            for (size_t n = 0; n < N; n += N_BLK) {
++                const size_t nb_cur = MIN(N_BLK, N - n);
+ 
+-                    main_func(
+-                        na_cur, nb_cur, k,
+-                        pack_a, pack_b,
+-                        &C[n * c_stride + m],
+-                        c_column_bytes);
+-                }
+-            } else {
+-                // leftover：一次性处理完整 K，提高精度
+                 const size_t na_pad = (na_cur + 3) & ~(size_t)3;
+                 const size_t nb_pad = (nb_cur + 3) & ~(size_t)3;
+ 
+@@ -4466,19 +4468,15 @@ matmul_q8_0_mmla_spack_b(size_t na,
+                     }
+                 }
+ 
+-                // 注意：这里直接用完整 K，不再拆 K_BLK
+-                const size_t k_full = K;
+-                const size_t kb_full = 0;
+-
+                 matmul_q8_0_mmla_4x4_tiled_padded(
+                     na_cur,
+                     nb_cur,
+                     na_pad,
+                     nb_pad,
+-                    k_full,
++                    K,
+                     m,
+                     n,
+-                    kb_full,
++                    0,
+                     A,
+                     B,
+                     a_stride_q_0,
+@@ -4497,6 +4495,104 @@ matmul_q8_0_mmla_spack_b(size_t na,
+                     na_cur,
+                     nb_cur);
+             }
++
++            continue;
++        }
++
++        for (size_t ki = 0; ki < K; ki += K_BLK) {
++            const size_t k  = MIN(K_BLK, K - ki);
++            const size_t kb = ki / QK8_0;
++
++            /*
++             * A panel 只 pack 一次，然后复用给所有 n tile。
++             */
++            matmul_q8_0_mmla_spack_padded(
++                true,
++                na_cur,
++                na_cur,
++                (int) k,
++                &A[m * a_stride_q_0 + kb],
++                a_column_bytes,
++                &pack_a);
++
++            for (size_t n = 0; n < N; n += N_BLK) {
++                const size_t nb_cur = MIN(N_BLK, N - n);
++
++                if ((nb_cur % 8) == 0) {
++                    matmul_q8_0_mmla_spack_padded(
++                        false,
++                        nb_cur,
++                        nb_cur,
++                        (int) k,
++                        &B[n * b_stride_q_0 + kb],
++                        b_column_bytes,
++                        &pack_b);
++                    main_func(
++                        na_cur,
++                        nb_cur,
++                        k,
++                        pack_a,
++                        pack_b,
++                        &C[n * c_stride + m],
++                        c_column_bytes);
++                } else {
++                    /*
++                     * N 方向 leftover：为了保持和原逻辑一致，用完整 K 的 4x4 tiled padded 路径。
++                     * 注意：因为当前已经在 ki 循环里，所以只允许 ki == 0 时做一次，
++                     * 其他 ki 跳过，避免重复累加。
++                     */
++                    if (ki == 0) {
++                        const size_t na_pad = (na_cur + 3) & ~(size_t)3;
++                        const size_t nb_pad = (nb_cur + 3) & ~(size_t)3;
++
++                        const size_t tmp_need = na_pad * nb_pad;
++                        if (tmp_need > tmp_c_cap) {
++                            free(tmp_c);
++                            tmp_c = NULL;
++                            tmp_c_cap = 0;
++
++                            void *ptr = NULL;
++                            int rc = posix_memalign(&ptr, 64, tmp_need * sizeof(float));
++                            GGML_ASSERT(rc == 0 && ptr != NULL);
++                            tmp_c = (float *)ptr;
++                            tmp_c_cap = tmp_need;
++                        }
++
++                        for (size_t jj = 0; jj < nb_pad; ++jj) {
++                            for (size_t ii = 0; ii < na_pad; ++ii) {
++                                tmp_c[jj * na_pad + ii] = 0.0f;
++                            }
++                        }
++
++                        matmul_q8_0_mmla_4x4_tiled_padded(
++                            na_cur,
++                            nb_cur,
++                            na_pad,
++                            nb_pad,
++                            K,
++                            m,
++                            n,
++                            0,
++                            A,
++                            B,
++                            a_stride_q_0,
++                            b_stride_q_0,
++                            a_column_bytes,
++                            b_column_bytes,
++                            tmp_c,
++                            &pack_a_tile,
++                            &pack_b_tile);
++
++                        matmul_accumulate_back_f32_tile(
++                            &C[n * c_stride + m],
++                            c_stride,
++                            tmp_c,
++                            na_pad,
++                            na_cur,
++                            nb_cur);
++                    }
++                }
++            }
+         }
+     }
+ 
+@@ -4508,195 +4604,295 @@ matmul_q8_0_mmla_spack_b(size_t na,
+ }
+ 
+ void
+-matmul_q8_0_mmla_8x8_b_micro_spack_neon(size_t M,
+-                                        size_t N,
+-                                        size_t K,
+-                                        const matmul_q8_0_mmla_spack_t* pack_a,
+-                                        const matmul_q8_0_mmla_spack_t* pack_b,
+-                                        void* GGML_RESTRICT c,
+-                                        size_t c_column_bytes)
++matmul_q8_0_mmla_8x8_b_micro_spack_neon(
++        size_t M,
++        size_t N,
++        size_t K,
++        const matmul_q8_0_mmla_spack_t * GGML_RESTRICT pack_a,
++        const matmul_q8_0_mmla_spack_t * GGML_RESTRICT pack_b,
++        void * GGML_RESTRICT c,
++        size_t c_column_bytes)
+ {
+     GGML_ASSERT(M % 8 == 0);
+     GGML_ASSERT(N % 8 == 0);
+     GGML_ASSERT(QK8_0 == 32);
++    GGML_ASSERT(c_column_bytes % sizeof(float32_t) == 0);
+ 
+     const size_t K_Q8_0 = (K + QK8_0 - 1) / QK8_0;
+ 
+-    float32_t* GGML_RESTRICT C = (float32_t*) c;
++    float32_t * GGML_RESTRICT C = (float32_t *) c;
+     const size_t c_stride = c_column_bytes / sizeof(float32_t);
+ 
+-#define LOAD_ACC_2R_2C(row_base, col_base) ((float32x4_t){                  \
+-        C[(col_base + 0) * c_stride + (row_base + 0)],                     \
+-        C[(col_base + 1) * c_stride + (row_base + 0)],                     \
+-        C[(col_base + 0) * c_stride + (row_base + 1)],                     \
+-        C[(col_base + 1) * c_stride + (row_base + 1)]                      \
++#define LOAD_ACC_2R_2C(row_base, col_base)                              \
++    ((float32x4_t) {                                                    \
++        C[((col_base) + 0) * c_stride + ((row_base) + 0)],              \
++        C[((col_base) + 1) * c_stride + ((row_base) + 0)],              \
++        C[((col_base) + 0) * c_stride + ((row_base) + 1)],              \
++        C[((col_base) + 1) * c_stride + ((row_base) + 1)]               \
+     })
+ 
+-#define STORE_ACC_2R_2C_DIRECT(acc, row_base, col_base) do {                \
+-        C[(col_base + 0) * c_stride + (row_base + 0)] = vgetq_lane_f32(acc, 0); \
+-        C[(col_base + 1) * c_stride + (row_base + 0)] = vgetq_lane_f32(acc, 1); \
+-        C[(col_base + 0) * c_stride + (row_base + 1)] = vgetq_lane_f32(acc, 2); \
+-        C[(col_base + 1) * c_stride + (row_base + 1)] = vgetq_lane_f32(acc, 3); \
++#define STORE_ACC_2R_2C(acc, row_base, col_base) do {                    \
++        C[((col_base) + 0) * c_stride + ((row_base) + 0)] =             \
++            vgetq_lane_f32((acc), 0);                                   \
++        C[((col_base) + 1) * c_stride + ((row_base) + 0)] =             \
++            vgetq_lane_f32((acc), 1);                                   \
++        C[((col_base) + 0) * c_stride + ((row_base) + 1)] =             \
++            vgetq_lane_f32((acc), 2);                                   \
++        C[((col_base) + 1) * c_stride + ((row_base) + 1)] =             \
++            vgetq_lane_f32((acc), 3);                                   \
++    } while (0)
++
++    /*
++     * 当前处理两个 A row-pair，共 4 行；
++     * 同时处理两个 B 四列 pack，共 8 列。
++     *
++     * acc0x: A 的第一个 row-pair
++     * acc1x: A 的第二个 row-pair
++     *
++     * x=0: B 列 i+0/i+1
++     * x=1: B 列 i+2/i+3
++     * x=2: B 列 i+4/i+5
++     * x=3: B 列 i+6/i+7
++     */
++#define MMLA_K8_STEP(a_off, b01_off, b23_off) do {                       \
++        const int8x16_t av0 = vld1q_s8(pa0 + (a_off));                  \
++        const int8x16_t av1 = vld1q_s8(pa1 + (a_off));                  \
++                                                                            \
++        const int8x16_t bv00 = vld1q_s8(pb0 + (b01_off));               \
++        const int8x16_t bv01 = vld1q_s8(pb0 + (b23_off));               \
++        const int8x16_t bv10 = vld1q_s8(pb1 + (b01_off));               \
++        const int8x16_t bv11 = vld1q_s8(pb1 + (b23_off));               \
++                                                                            \
++        acc00s = vmmlaq_s32(acc00s, av0, bv00);                         \
++        acc01s = vmmlaq_s32(acc01s, av0, bv01);                         \
++        acc02s = vmmlaq_s32(acc02s, av0, bv10);                         \
++        acc03s = vmmlaq_s32(acc03s, av0, bv11);                         \
++                                                                            \
++        acc10s = vmmlaq_s32(acc10s, av1, bv00);                         \
++        acc11s = vmmlaq_s32(acc11s, av1, bv01);                         \
++        acc12s = vmmlaq_s32(acc12s, av1, bv10);                         \
++        acc13s = vmmlaq_s32(acc13s, av1, bv11);                         \
++    } while (0)
++
++#define COMPUTE_4X8(                                                     \
++        row_base,                                                       \
++        psa_pair0, psa_pair1,                                           \
++        pap_pair0, pap_pair1) do {                                      \
++                                                                            \
++        float32x4_t acc00f =                                            \
++            LOAD_ACC_2R_2C((row_base) + 0, i + 0);                     \
++        float32x4_t acc01f =                                            \
++            LOAD_ACC_2R_2C((row_base) + 0, i + 2);                     \
++        float32x4_t acc02f =                                            \
++            LOAD_ACC_2R_2C((row_base) + 0, i + 4);                     \
++        float32x4_t acc03f =                                            \
++            LOAD_ACC_2R_2C((row_base) + 0, i + 6);                     \
++                                                                            \
++        float32x4_t acc10f =                                            \
++            LOAD_ACC_2R_2C((row_base) + 2, i + 0);                     \
++        float32x4_t acc11f =                                            \
++            LOAD_ACC_2R_2C((row_base) + 2, i + 2);                     \
++        float32x4_t acc12f =                                            \
++            LOAD_ACC_2R_2C((row_base) + 2, i + 4);                     \
++        float32x4_t acc13f =                                            \
++            LOAD_ACC_2R_2C((row_base) + 2, i + 6);                     \
++                                                                            \
++        const float32_t * GGML_RESTRICT sa0p = (psa_pair0);             \
++        const float32_t * GGML_RESTRICT sa1p = (psa_pair1);             \
++        const float32_t * GGML_RESTRICT sb0p = psb0;                    \
++        const float32_t * GGML_RESTRICT sb1p = psb1;                    \
++                                                                            \
++        const int8_t * GGML_RESTRICT pa0 = (pap_pair0);                 \
++        const int8_t * GGML_RESTRICT pa1 = (pap_pair1);                 \
++        const int8_t * GGML_RESTRICT pb0 = pbp0;                        \
++        const int8_t * GGML_RESTRICT pb1 = pbp1;                        \
++                                                                            \
++        for (size_t ki = 0; ki < K_Q8_0; ++ki) {                        \
++            /* A 的两个 row-pair scale。 */                              \
++            const float32x4_t scale_a0 = vld1q_f32(sa0p);               \
++            const float32x4_t scale_a1 = vld1q_f32(sa1p);               \
++            sa0p += 4;                                                   \
++            sa1p += 4;                                                   \
++                                                                            \
++            /*                                                          \
++             * 每个 B 四列 pack 有两个列对的 scale：                     \
++             *   +0：列 0/1                                             \
++             *   +4：列 2/3                                             \
++             */                                                         \
++            const float32x4_t scale_b00 = vld1q_f32(sb0p + 0);          \
++            const float32x4_t scale_b01 = vld1q_f32(sb0p + 4);          \
++            const float32x4_t scale_b10 = vld1q_f32(sb1p + 0);          \
++            const float32x4_t scale_b11 = vld1q_f32(sb1p + 4);          \
++            sb0p += 8;                                                   \
++            sb1p += 8;                                                   \
++                                                                            \
++            int32x4_t acc00s = vdupq_n_s32(0);                           \
++            int32x4_t acc01s = vdupq_n_s32(0);                           \
++            int32x4_t acc02s = vdupq_n_s32(0);                           \
++            int32x4_t acc03s = vdupq_n_s32(0);                           \
++            int32x4_t acc10s = vdupq_n_s32(0);                           \
++            int32x4_t acc11s = vdupq_n_s32(0);                           \
++            int32x4_t acc12s = vdupq_n_s32(0);                           \
++            int32x4_t acc13s = vdupq_n_s32(0);                           \
++                                                                            \
++            /*                                                          \
++             * A/B packed 对应关系：                                    \
++             *                                                          \
++             * A +0  : K  0..7                                          \
++             * B +0  : cols 0/1, K  0..7                               \
++             * B +16 : cols 2/3, K  0..7                               \
++             *                                                          \
++             * A +16 : K  8..15                                         \
++             * B +32 : cols 0/1, K  8..15                              \
++             * B +48 : cols 2/3, K  8..15                              \
++             *                                                          \
++             * A +32 : K 16..23                                         \
++             * B +64 : cols 0/1, K 16..23                              \
++             * B +80 : cols 2/3, K 16..23                              \
++             *                                                          \
++             * A +48  : K 24..31                                        \
++             * B +96  : cols 0/1, K 24..31                             \
++             * B +112 : cols 2/3, K 24..31                             \
++             */                                                         \
++            MMLA_K8_STEP( 0,  0,  16);                                  \
++            MMLA_K8_STEP(16, 32,  48);                                  \
++            MMLA_K8_STEP(32, 64,  80);                                  \
++            MMLA_K8_STEP(48, 96, 112);                                  \
++                                                                            \
++            pa0 += 64;                                                   \
++            pa1 += 64;                                                   \
++            pb0 += 128;                                                  \
++            pb1 += 128;                                                  \
++                                                                            \
++            /*                                                          \
++             * 逐项做 convert、scale 和 FP32 累加，避免同时保留          \
++             * 8 个 scale product 临时向量。                             \
++             */                                                         \
++            acc00f = vfmaq_f32(                                         \
++                acc00f,                                                 \
++                vcvtq_f32_s32(acc00s),                                  \
++                vmulq_f32(scale_a0, scale_b00));                        \
++                                                                            \
++            acc01f = vfmaq_f32(                                         \
++                acc01f,                                                 \
++                vcvtq_f32_s32(acc01s),                                  \
++                vmulq_f32(scale_a0, scale_b01));                        \
++                                                                            \
++            acc02f = vfmaq_f32(                                         \
++                acc02f,                                                 \
++                vcvtq_f32_s32(acc02s),                                  \
++                vmulq_f32(scale_a0, scale_b10));                        \
++                                                                            \
++            acc03f = vfmaq_f32(                                         \
++                acc03f,                                                 \
++                vcvtq_f32_s32(acc03s),                                  \
++                vmulq_f32(scale_a0, scale_b11));                        \
++                                                                            \
++            acc10f = vfmaq_f32(                                         \
++                acc10f,                                                 \
++                vcvtq_f32_s32(acc10s),                                  \
++                vmulq_f32(scale_a1, scale_b00));                        \
++                                                                            \
++            acc11f = vfmaq_f32(                                         \
++                acc11f,                                                 \
++                vcvtq_f32_s32(acc11s),                                  \
++                vmulq_f32(scale_a1, scale_b01));                        \
++                                                                            \
++            acc12f = vfmaq_f32(                                         \
++                acc12f,                                                 \
++                vcvtq_f32_s32(acc12s),                                  \
++                vmulq_f32(scale_a1, scale_b10));                        \
++                                                                            \
++            acc13f = vfmaq_f32(                                         \
++                acc13f,                                                 \
++                vcvtq_f32_s32(acc13s),                                  \
++                vmulq_f32(scale_a1, scale_b11));                        \
++        }                                                               \
++                                                                            \
++        STORE_ACC_2R_2C(acc00f, (row_base) + 0, i + 0);                 \
++        STORE_ACC_2R_2C(acc01f, (row_base) + 0, i + 2);                 \
++        STORE_ACC_2R_2C(acc02f, (row_base) + 0, i + 4);                 \
++        STORE_ACC_2R_2C(acc03f, (row_base) + 0, i + 6);                 \
++                                                                            \
++        STORE_ACC_2R_2C(acc10f, (row_base) + 2, i + 0);                 \
++        STORE_ACC_2R_2C(acc11f, (row_base) + 2, i + 2);                 \
++        STORE_ACC_2R_2C(acc12f, (row_base) + 2, i + 4);                 \
++        STORE_ACC_2R_2C(acc13f, (row_base) + 2, i + 6);                 \
+     } while (0)
+ 
+     for (size_t i = 0; i < N; i += 8) {
++        /*
++         * B 前四列与后四列的 pack 起点。
++         */
++        const float32_t * GGML_RESTRICT psb0 =
++            &pack_b->scale[
++                (i + 0) * pack_b->scale_stride * 2];
++
++        const float32_t * GGML_RESTRICT psb1 =
++            &pack_b->scale[
++                (i + 4) * pack_b->scale_stride * 2];
++
++        const int8_t * GGML_RESTRICT pbp0 =
++            &pack_b->p[(i + 0) * pack_b->p_stride];
++
++        const int8_t * GGML_RESTRICT pbp1 =
++            &pack_b->p[(i + 4) * pack_b->p_stride];
++
+         for (size_t j = 0; j < M; j += 8) {
+-            float32x4_t acc00f = LOAD_ACC_2R_2C(j + 0, i + 0);
+-            float32x4_t acc01f = LOAD_ACC_2R_2C(j + 0, i + 4);
+-            float32x4_t acc10f = LOAD_ACC_2R_2C(j + 2, i + 0);
+-            float32x4_t acc11f = LOAD_ACC_2R_2C(j + 2, i + 4);
+-            float32x4_t acc20f = LOAD_ACC_2R_2C(j + 4, i + 0);
+-            float32x4_t acc21f = LOAD_ACC_2R_2C(j + 4, i + 4);
+-            float32x4_t acc30f = LOAD_ACC_2R_2C(j + 6, i + 0);
+-            float32x4_t acc31f = LOAD_ACC_2R_2C(j + 6, i + 4);
+-
+-            const float32_t* GGML_RESTRICT psa0 =
+-                &pack_a->scale[(j + 0) * pack_a->scale_stride * 2];
+-            const float32_t* GGML_RESTRICT psa1 =
+-                &pack_a->scale[(j + 2) * pack_a->scale_stride * 2];
+-            const float32_t* GGML_RESTRICT psa2 =
+-                &pack_a->scale[(j + 4) * pack_a->scale_stride * 2];
+-            const float32_t* GGML_RESTRICT psa3 =
+-                &pack_a->scale[(j + 6) * pack_a->scale_stride * 2];
+-
+-            const float32_t* GGML_RESTRICT psb0 =
+-                &pack_b->scale[(i + 0) * pack_b->scale_stride * 2];
+-            const float32_t* GGML_RESTRICT psb1 =
+-                &pack_b->scale[(i + 4) * pack_b->scale_stride * 2];
+-
+-            const int8_t* GGML_RESTRICT pap0 =
++            /*
++             * 前四行。
++             */
++            const float32_t * GGML_RESTRICT psa0 =
++                &pack_a->scale[
++                    (j + 0) * pack_a->scale_stride * 2];
++
++            const float32_t * GGML_RESTRICT psa1 =
++                &pack_a->scale[
++                    (j + 2) * pack_a->scale_stride * 2];
++
++            const int8_t * GGML_RESTRICT pap0 =
+                 &pack_a->p[(j + 0) * pack_a->p_stride];
+-            const int8_t* GGML_RESTRICT pap1 =
++
++            const int8_t * GGML_RESTRICT pap1 =
+                 &pack_a->p[(j + 2) * pack_a->p_stride];
+-            const int8_t* GGML_RESTRICT pap2 =
++
++            COMPUTE_4X8(
++                j + 0,
++                psa0,
++                psa1,
++                pap0,
++                pap1);
++
++            /*
++             * 后四行。
++             */
++            const float32_t * GGML_RESTRICT psa2 =
++                &pack_a->scale[
++                    (j + 4) * pack_a->scale_stride * 2];
++
++            const float32_t * GGML_RESTRICT psa3 =
++                &pack_a->scale[
++                    (j + 6) * pack_a->scale_stride * 2];
++
++            const int8_t * GGML_RESTRICT pap2 =
+                 &pack_a->p[(j + 4) * pack_a->p_stride];
+-            const int8_t* GGML_RESTRICT pap3 =
+-                &pack_a->p[(j + 6) * pack_a->p_stride];
+ 
+-            const int8_t* GGML_RESTRICT pbp0 =
+-                &pack_b->p[(i + 0) * pack_b->p_stride];
+-            const int8_t* GGML_RESTRICT pbp1 =
+-                &pack_b->p[(i + 4) * pack_b->p_stride];
+-
+-            const float32_t *sa0p = psa0;
+-            const float32_t *sa1p = psa1;
+-            const float32_t *sa2p = psa2;
+-            const float32_t *sa3p = psa3;
+-            const float32_t *sb0p = psb0;
+-            const float32_t *sb1p = psb1;
+-            const int8_t * GGML_RESTRICT pa0 = pap0;
+-            const int8_t * GGML_RESTRICT pa1 = pap1;
+-            const int8_t * GGML_RESTRICT pa2 = pap2;
+-            const int8_t * GGML_RESTRICT pa3 = pap3;
+-            const int8_t * GGML_RESTRICT pb0 = pbp0;
+-            const int8_t * GGML_RESTRICT pb1 = pbp1;
+-            for (size_t ki = 0; ki < K_Q8_0; ++ki) {
+-                /**
+-                每个ki：
+-                6 个 scale vector load
+-                8 个 scale vmul
+-                8 个 int32->fp32 convert
+-                8 个 fp32 vfma
+-                */
+-                /*
+-                 * scale 提前 load，避免 scale load 紧贴 vfma。
+-                 */
+-                float32x4_t scale_a0 = vld1q_f32(sa0p); sa0p += 4;
+-                float32x4_t scale_a1 = vld1q_f32(sa1p); sa1p += 4;
+-                float32x4_t scale_a2 = vld1q_f32(sa2p); sa2p += 4;
+-                float32x4_t scale_a3 = vld1q_f32(sa3p); sa3p += 4;
+-
+-                float32x4_t scale_b0 = vld1q_f32(sb0p); sb0p += 8;
+-                float32x4_t scale_b1 = vld1q_f32(sb1p); sb1p += 8;
+-
+-                float32x4_t s00 = vmulq_f32(scale_a0, scale_b0);
+-                float32x4_t s01 = vmulq_f32(scale_a0, scale_b1);
+-                float32x4_t s10 = vmulq_f32(scale_a1, scale_b0);
+-                float32x4_t s11 = vmulq_f32(scale_a1, scale_b1);
+-                float32x4_t s20 = vmulq_f32(scale_a2, scale_b0);
+-                float32x4_t s21 = vmulq_f32(scale_a2, scale_b1);
+-                float32x4_t s30 = vmulq_f32(scale_a3, scale_b0);
+-                float32x4_t s31 = vmulq_f32(scale_a3, scale_b1);
+-
+-                int32x4_t acc00s = vdupq_n_s32(0);
+-                int32x4_t acc01s = vdupq_n_s32(0);
+-                int32x4_t acc10s = vdupq_n_s32(0);
+-                int32x4_t acc11s = vdupq_n_s32(0);
+-                int32x4_t acc20s = vdupq_n_s32(0);
+-                int32x4_t acc21s = vdupq_n_s32(0);
+-                int32x4_t acc30s = vdupq_n_s32(0);
+-                int32x4_t acc31s = vdupq_n_s32(0);
+-
+-                /*
+-                 * QK8_0 == 32:
+-                 * A 每个 ki 占 64B，t=0 偏移 0，t=16 偏移 32。
+-                 * B 每个 ki 占 128B，t=0 偏移 0，t=16 偏移 64。
+-                 */
+-                pa0 += 64;
+-                pa1 += 64;
+-                pa2 += 64;
+-                pa3 += 64;
+-                pb0 += 128;
+-                pb1 += 128;
+-                /*
+-                 * 双缓冲式提前 load：
+-                 * 先 load t=0 和 t=16 两批，再做 MMLA。
+-                 */
+-                int8x16_t a0_0 = vld1q_s8(pa0 + 0);
+-                int8x16_t a1_0 = vld1q_s8(pa1 + 0);
+-                int8x16_t a2_0 = vld1q_s8(pa2 + 0);
+-                int8x16_t a3_0 = vld1q_s8(pa3 + 0);
+-                int8x16_t b0_0 = vld1q_s8(pb0 + 0);
+-                int8x16_t b1_0 = vld1q_s8(pb1 + 0);
+-
+-                int8x16_t a0_1 = vld1q_s8(pa0 + 32);
+-                int8x16_t a1_1 = vld1q_s8(pa1 + 32);
+-                int8x16_t a2_1 = vld1q_s8(pa2 + 32);
+-                int8x16_t a3_1 = vld1q_s8(pa3 + 32);
+-                int8x16_t b0_1 = vld1q_s8(pb0 + 64);
+-                int8x16_t b1_1 = vld1q_s8(pb1 + 64);
+-
+-                acc00s = vmmlaq_s32(acc00s, a0_0, b0_0);
+-                acc01s = vmmlaq_s32(acc01s, a0_0, b1_0);
+-                acc10s = vmmlaq_s32(acc10s, a1_0, b0_0);
+-                acc11s = vmmlaq_s32(acc11s, a1_0, b1_0);
+-                acc20s = vmmlaq_s32(acc20s, a2_0, b0_0);
+-                acc21s = vmmlaq_s32(acc21s, a2_0, b1_0);
+-                acc30s = vmmlaq_s32(acc30s, a3_0, b0_0);
+-                acc31s = vmmlaq_s32(acc31s, a3_0, b1_0);
+-
+-                acc00s = vmmlaq_s32(acc00s, a0_1, b0_1);
+-                acc01s = vmmlaq_s32(acc01s, a0_1, b1_1);
+-                acc10s = vmmlaq_s32(acc10s, a1_1, b0_1);
+-                acc11s = vmmlaq_s32(acc11s, a1_1, b1_1);
+-                acc20s = vmmlaq_s32(acc20s, a2_1, b0_1);
+-                acc21s = vmmlaq_s32(acc21s, a2_1, b1_1);
+-                acc30s = vmmlaq_s32(acc30s, a3_1, b0_1);
+-                acc31s = vmmlaq_s32(acc31s, a3_1, b1_1);
+-
+-                acc00f = vfmaq_f32(acc00f, vcvtq_f32_s32(acc00s), s00);
+-                acc01f = vfmaq_f32(acc01f, vcvtq_f32_s32(acc01s), s01);
+-                acc10f = vfmaq_f32(acc10f, vcvtq_f32_s32(acc10s), s10);
+-                acc11f = vfmaq_f32(acc11f, vcvtq_f32_s32(acc11s), s11);
+-                acc20f = vfmaq_f32(acc20f, vcvtq_f32_s32(acc20s), s20);
+-                acc21f = vfmaq_f32(acc21f, vcvtq_f32_s32(acc21s), s21);
+-                acc30f = vfmaq_f32(acc30f, vcvtq_f32_s32(acc30s), s30);
+-                acc31f = vfmaq_f32(acc31f, vcvtq_f32_s32(acc31s), s31);
+-            }
++            const int8_t * GGML_RESTRICT pap3 =
++                &pack_a->p[(j + 6) * pack_a->p_stride];
+ 
+-            STORE_ACC_2R_2C_DIRECT(acc00f, j + 0, i + 0);
+-            STORE_ACC_2R_2C_DIRECT(acc01f, j + 0, i + 4);
+-            STORE_ACC_2R_2C_DIRECT(acc10f, j + 2, i + 0);
+-            STORE_ACC_2R_2C_DIRECT(acc11f, j + 2, i + 4);
+-            STORE_ACC_2R_2C_DIRECT(acc20f, j + 4, i + 0);
+-            STORE_ACC_2R_2C_DIRECT(acc21f, j + 4, i + 4);
+-            STORE_ACC_2R_2C_DIRECT(acc30f, j + 6, i + 0);
+-            STORE_ACC_2R_2C_DIRECT(acc31f, j + 6, i + 4);
++            COMPUTE_4X8(
++                j + 4,
++                psa2,
++                psa3,
++                pap2,
++                pap3);
+         }
+     }
+ 
++#undef COMPUTE_4X8
++#undef MMLA_K8_STEP
+ #undef LOAD_ACC_2R_2C
+-#undef STORE_ACC_2R_2C_DIRECT
++#undef STORE_ACC_2R_2C
+ }
+ 
+ void
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-quants.h b/ggml/src/ggml-cpu/ggml-cpu-quants.h
+index 0945968c..04fb648d 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-quants.h
++++ b/ggml/src/ggml-cpu/ggml-cpu-quants.h
+@@ -61,7 +61,7 @@ void ggml_vec_dot_iq4_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const
+ void ggml_vec_dot_iq3_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ 
+ // mmla
+-static size_t g_chunk_size_q8_0_mmla_spack = 128;
++static size_t g_chunk_size_q8_0_mmla_spack = 1024;
+ typedef struct matmul_q8_0_mmla_spack_t
+ {
+     // 每2个A行混部8个
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 9a9e07f1..4954187f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1303,8 +1303,23 @@ static void compute_forward_mul_mat_one_chunk_matmul_kernel_fp32(
+     const int64_t blck_1 = 4;
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
++            // Check if i02/i03 (src0 batch indices) would change within the 4x4 block.
++            // The 4x4 kernel assumes pr0 (src0 row pointers) are constant across all 4 ir1 rows.
++            // This is violated when i11 wraps at ne1 boundary, changing i12 -> i02 (if r2==1)
++            // or i13 -> i03 (if r3==1). Fall back to vec_dot in that case.
++            bool block_unsafe = false;
++            if (iir1 + blck_1 <= ir1_end) {
++                const int64_t first_i13 = iir1 / (ne12 * ne1);
++                const int64_t first_i12 = (iir1 - first_i13 * ne12 * ne1) / ne1;
++                const int64_t last_ir1  = iir1 + blck_1 - 1;
++                const int64_t last_i13  = last_ir1 / (ne12 * ne1);
++                const int64_t last_i12  = (last_ir1 - last_i13 * ne12 * ne1) / ne1;
++                if (first_i12 / r2 != last_i12 / r2 || first_i13 / r3 != last_i13 / r3) {
++                    block_unsafe = true;
++                }
++            }
+             // handle leftovers using vec_dot
+-            if (iir1 + blck_1 > ir1_end || iir0 + blck_0 > ir0_end) {
++            if (block_unsafe || iir1 + blck_1 > ir1_end || iir0 + blck_0 > ir0_end) {
+                 for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += 1) {
+                     const int64_t i13 = (ir1 / (ne12 * ne1));
+                     const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+@@ -1325,8 +1340,13 @@ static void compute_forward_mul_mat_one_chunk_matmul_kernel_fp32(
+                         ((const char*)wdata + (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size):
+                         ((const char*)wdata + (i11 * nb11 + i12 * nb12 + i13 * nb13));
+ 
+-                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+-                        vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
++                    float tmp4[4];
++                    int ni = 0;
++                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0, ++ni) {
++                        vec_dot(ne00, &tmp4[ni], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
++                    }
++                    for (int i = 0; i < ni; i++) {
++                        dst_col[iir0 + i] = tmp4[i];
+                     }
+                 }
+             } else {
+@@ -1365,11 +1385,19 @@ static void compute_forward_mul_mat_one_chunk_matmul_kernel_fp32(
+                 }
+                 #if 0
+                 // scalar check
+-                for (int64_t ib1 = 0; ib1 < 4; ib1++) {
+-                    for (int64_t ib0 = 0; ib0 < 4; ib0++) {
+-                        pdst[ib1][ib0] = 0.0f;
+-                        for (int64_t k = 0; k < ne00; k++) {
+-                            pdst[ib1][ib0] += pr0[ib0][k] * pr1[ib1][k];
++                {
++                    float tmp[4][4];
++                    for (int64_t ib1 = 0; ib1 < 4; ib1++) {
++                        for (int64_t ib0 = 0; ib0 < 4; ib0++) {
++                            tmp[ib1][ib0] = 0.0f;
++                            for (int64_t k = 0; k < ne00; k++) {
++                                tmp[ib1][ib0] += pr0[ib0][k] * pr1[ib1][k];
++                            }
++                        }
++                    }
++                    for (int64_t ib1 = 0; ib1 < 4; ib1++) {
++                        for (int64_t ib0 = 0; ib0 < 4; ib0++) {
++                            pdst[ib1][ib0] = tmp[ib1][ib0];
+                         }
+                     }
+                 }
+@@ -1712,21 +1740,116 @@ UseGgmlGemm2:;
+     // CEIL(nr0/chunk_size)
+     int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+     int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+-    // fprintf(stderr, "chunk_size=%d,nchunk0=%d,nchunk1=%d\n", chunk_size,nchunk0,nchunk1);
+-
+-    // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
+-    //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
+-    //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
+-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+-        // distribute the thread work across the inner or outer loop based on which one is larger
+-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
+-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
++    /*
++    * FP16 PackA matmul scheduling optimization.
++    *
++    * Current optimized micro-kernel:
++    *   M tile = 16
++    *   N tile = 8
++    *
++    * Current outer blocking:
++    *   M_BLK = g_chunk_size_outer_packA / 4
++    *   N_BLK = g_chunk_size_outer_packA
++    *
++    * For sufficiently large N, prefer splitting only along M:
++    *
++    *     nchunk0 = nth
++    *     nchunk1 = 1
++    *
++    * so each thread owns a different M range but processes the full N range.
++    *
++    * Benefit:
++    *
++    *     packA(M block)
++    *          |
++    *          +--> N block 0
++    *          +--> N block 1
++    *          +--> ...
++    *
++    * instead of splitting N across threads and packing the same A block again
++    * for every N chunk.
++    *
++    * Example, g_chunk_size_outer_packA = 128:
++    *
++    *     N = 512 -> 4 N blocks / packed A
++    *     N = 256 -> 2 N blocks / packed A
++    *
++    * We currently enable M-only scheduling when N contains at least two
++    * outer N blocks.
++    */
++    const int64_t matmul_m_tile = 16;
++    const int64_t matmul_n_block = g_chunk_size_outer_packA;
++
++    /*
++    * Only use this policy for the optimized FP16 PackA matmul path.
++    *
++    * Conditions:
++    *
++    * 1. matmul kernel is available;
++    * 2. source weight type is F16;
++    * 3. N is large enough to reuse one packed-A block across >= 2 N blocks;
++    * 4. each thread receives at least one complete 16-M micro-kernel tile;
++    * 5. M can be divided evenly across threads;
++    * 6. each thread's M range remains 16-aligned.
++    */
++    const bool prefer_m_only =
++            is_matmul_valid &&
++            src0->type == GGML_TYPE_F16 &&
++            nr1 >= 2 * matmul_n_block &&
++            nth > 0 &&
++            nr0 >= (int64_t) nth * matmul_m_tile &&
++            (nr0 % nth) == 0 &&
++            ((nr0 / nth) % matmul_m_tile) == 0;
++    const bool prefer_q8_m_only =
++            is_matmul_valid &&
++            src0->type == GGML_TYPE_Q8_0 &&
++            nth > 0 &&
++            nr0 >= (int64_t) nth * 8 &&
++            (nr0 % nth) == 0 &&
++            ((nr0 / nth) % 8) == 0;
++    if (prefer_q8_m_only || prefer_m_only) {
++        /*
++        * Examples:
++        *
++        * M=1024 N=512 nth=2:
++        *   nchunk0=2, nchunk1=1
++        *   each thread: M=512, N=512
++        *
++        * M=1024 N=512 nth=4:
++        *   nchunk0=4, nchunk1=1
++        *   each thread: M=256, N=512
++        *
++        * M=1024 N=256 nth=4:
++        *   nchunk0=4, nchunk1=1
++        *   each thread: M=256, N=256
++        */
++        nchunk0 = nth;
++        nchunk1 = 1;
++
++    } else if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
++        // Existing generic fallback.
++        nchunk0 = nr0 > nr1 ? nth : 1;
++        nchunk1 = nr0 > nr1 ? 1 : nth;
+     }
+-
+     // The number of elements in each chunk
+     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+-
++    // if (ith == 0) {
++    //     fprintf(stderr,
++    //         "[MATMUL] M=%ld N=%ld K=%ld nth=%d "
++    //         "chunk_size=%d nchunk0=%ld nchunk1=%ld "
++    //         "dr0=%ld dr1=%ld numa=%d\n",
++    //         (long) nr0,
++    //         (long) nr1,
++    //         (long) ne00,
++    //         nth,
++    //         chunk_size,
++    //         (long) nchunk0,
++    //         (long) nchunk1,
++    //         (long) dr0,
++    //         (long) dr1,
++    //         ggml_is_numa());
++    // }
+     // The first chunk comes from our thread_id, the rest will get auto-assigned.
+     int current_chunk = ith;
+ 
+@@ -1783,8 +1906,6 @@ UseGgmlGemm2:;
+     }
+ }
+ 
+-// ggml_compute_forward_mul_mat_id
+-
+ #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
+ 
+ struct mmid_row_mapping {
+@@ -2044,7 +2165,14 @@ static void ggml_compute_forward_mul_mat_id(
+ }
+ 
+ /////////////////////////////////
+-
++// static inline uint64_t now_ns(void) {
++//     struct timespec ts;
++//     clock_gettime(CLOCK_MONOTONIC, &ts);
++//     return (uint64_t) ts.tv_sec * 1000000000ull + ts.tv_nsec;
++// }
++
++// static _Atomic uint64_t g_op_ns[GGML_OP_COUNT];
++// static _Atomic uint64_t g_op_cnt[GGML_OP_COUNT];
+ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+     GGML_ASSERT(params);
+ 
+@@ -2057,6 +2185,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+         return;
+     }
+ 
++    // uint64_t t0 = now_ns();
+     switch (tensor->op) {
+         case GGML_OP_DUP:
+             {
+@@ -2405,6 +2534,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+                 GGML_ABORT("fatal error");
+             }
+     }
++    // uint64_t dt = now_ns() - t0;
++    // atomic_fetch_add_explicit(&g_op_ns[tensor->op], dt, memory_order_relaxed);
++    // atomic_fetch_add_explicit(&g_op_cnt[tensor->op], 1, memory_order_relaxed);
+ }
+ 
+ // Android's libc implementation "bionic" does not support setting affinity
+@@ -3224,7 +3356,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     }
+ 
+     ggml_barrier(state->threadpool);
+-
++    // for (int op = 0; op < GGML_OP_COUNT; ++op) {
++    //     uint64_t ns  = atomic_load_explicit(&g_op_ns[op], memory_order_relaxed);
++    //     uint64_t cnt = atomic_load_explicit(&g_op_cnt[op], memory_order_relaxed);
++
++    //     if (cnt > 0) {
++    //         fprintf(stderr,
++    //             "[op time] op=%s cnt=%lu time=%.3f ms avg=%.3f us\n",
++    //             ggml_op_name((enum ggml_op) op),
++    //             cnt,
++    //             ns / 1e6,
++    //             cnt ? (ns / 1e3 / cnt) : 0.0);
++    //     }
++    // }
+     return 0;
+ }
+ 
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 77b5a1d8..f682c3a3 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -7321,9 +7321,13 @@ void ggml_compute_forward_fused_cpp_sdpa_ext(
+     }
+ 
+     // offset data pointers to the start of this thread's head range
+-    const float * q_h = (const float *) q->data + h_start * (q->nb[1] / sizeof(float));
+-    const float * k_h = (const float *) k->data + h_start * (k->nb[1] / sizeof(float));
+-    const float * v_h = (const float *) v->data + h_start * (v->nb[1] / sizeof(float));
++    // q/k/v after permute(0,2,1,3) have shape [D, n_tokens, n_head, B];
++    //   nb[2] is the stride for the n_head dimension (= D*4)
++    // dst has shape [D, n_head, n_tokens, B];
++    //   nb[1] is the stride for the n_head dimension (= D*4)
++    const float * q_h = (const float *) q->data + h_start * (q->nb[2] / sizeof(float));
++    const float * k_h = (const float *) k->data + h_start * (k->nb[2] / sizeof(float));
++    const float * v_h = (const float *) v->data + h_start * (v->nb[2] / sizeof(float));
+           float * o_h = (      float *) dst->data + h_start * (dst->nb[1] / sizeof(float));
+ 
+     const int64_t H_th = h_end - h_start;
+@@ -7331,16 +7335,88 @@ void ggml_compute_forward_fused_cpp_sdpa_ext(
+     const uint16_t * mask_f16 = (mask != nullptr && mask->type == GGML_TYPE_F16) ? (const uint16_t *) mask->data : nullptr;
+     const float    * mask_f32 = (mask != nullptr && mask->type == GGML_TYPE_F32) ? (const float    *) mask->data : nullptr;
+ 
+-    ggml_compute_forward_fused_cpp_sdpa_ext_impl(
+-            q_h, k_h, v_h, mask_f32, mask_f16, o_h,
+-            B, H_th, L, S, D, DV,
+-            (int64_t) q->nb[0], (int64_t) q->nb[1], (int64_t) q->nb[2], (int64_t) q->nb[3],
+-            (int64_t) k->nb[0], (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
+-            (int64_t) v->nb[0], (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
+-            (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
+-            mask ? mask->ne[0] : 0, mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+-            mask ? mask->nb[0] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+-            scale);
++    const int64_t BLK = 64;
++
++    /*
++    * 对角块 SDPA:
++    * 适用于 L == S 的 prompt processing 场景。
++    *
++    * 原始:
++    *   L x S
++    *
++    * 改后:
++    *   多个 64 x 64 对角块
++    *
++    * 注意：这不是严格等价优化，正确性后面需要验证。
++    */
++    if (L == S && L > BLK && (L % BLK) == 0) {
++        for (int64_t l0 = 0; l0 < L; l0 += BLK) {
++            const int64_t L_cur = BLK;
++            const int64_t S_cur = BLK;
++
++            const float * q_blk =
++                q_h + l0 * (q->nb[1] / sizeof(float));
++
++            const float * k_blk =
++                k_h + l0 * (k->nb[1] / sizeof(float));
++
++            const float * v_blk =
++                v_h + l0 * (v->nb[1] / sizeof(float));
++
++            float * o_blk =
++                o_h + l0 * (dst->nb[2] / sizeof(float));
++
++            const float * mask_f32_blk =
++                mask_f32 ?
++                mask_f32
++                    + l0 * (mask->nb[1] / sizeof(float))
++                    + l0 * (mask->nb[0] / sizeof(float))
++                : nullptr;
++
++            const uint16_t * mask_f16_blk =
++                mask_f16 ?
++                mask_f16
++                    + l0 * (mask->nb[1] / sizeof(uint16_t))
++                    + l0 * (mask->nb[0] / sizeof(uint16_t))
++                : nullptr;
++
++            ggml_compute_forward_fused_cpp_sdpa_ext_impl(
++                    q_blk, k_blk, v_blk, mask_f32_blk, mask_f16_blk, o_blk,
++                    B, H_th, L_cur, S_cur, D, DV,
++                    (int64_t) q->nb[0],   (int64_t) q->nb[1],   (int64_t) q->nb[2],   (int64_t) q->nb[3],
++                    (int64_t) k->nb[0],   (int64_t) k->nb[1],   (int64_t) k->nb[2],   (int64_t) k->nb[3],
++                    (int64_t) v->nb[0],   (int64_t) v->nb[1],   (int64_t) v->nb[2],   (int64_t) v->nb[3],
++                    (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
++
++                    mask ? S_cur       : 0,
++                    mask ? L_cur       : 0,
++                    mask ? mask->ne[2] : 0,
++                    mask ? mask->ne[3] : 0,
++                    mask ? mask->nb[0] : 0,
++                    mask ? mask->nb[1] : 0,
++                    mask ? mask->nb[2] : 0,
++                    mask ? mask->nb[3] : 0,
++                    scale);
++        }
++    } else {
++        ggml_compute_forward_fused_cpp_sdpa_ext_impl(
++                q_h, k_h, v_h, mask_f32, mask_f16, o_h,
++                B, H_th, L, S, D, DV,
++                (int64_t) q->nb[0],   (int64_t) q->nb[1],   (int64_t) q->nb[2],   (int64_t) q->nb[3],
++                (int64_t) k->nb[0],   (int64_t) k->nb[1],   (int64_t) k->nb[2],   (int64_t) k->nb[3],
++                (int64_t) v->nb[0],   (int64_t) v->nb[1],   (int64_t) v->nb[2],   (int64_t) v->nb[3],
++                (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
++                mask ? mask->ne[0] : 0,
++                mask ? mask->ne[1] : 0,
++                mask ? mask->ne[2] : 0,
++                mask ? mask->ne[3] : 0,
++                mask ? mask->nb[0] : 0,
++                mask ? mask->nb[1] : 0,
++                mask ? mask->nb[2] : 0,
++                mask ? mask->nb[3] : 0,
++                scale);
++    }
++
+ #else
+     GGML_UNUSED(params);
+     GGML_UNUSED(dst);
+diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
+index 2c3b0dfb..8014c87d 100644
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -81,12 +81,14 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
+             ay1 = GGML_F32_VEC_LOAD(y + i);
+             sum1 = GGML_F32_VEC_FMA(ax1, ay1, sum1);
+         }
+-        // maximum number of leftover elements will be less that ggml_f32_epr. Apply predicated svmad on available elements only
++        // maximum number of leftover elements will be less that ggml_f32_epr. Apply predicated svmla on available elements only
++        // Note: must use svmla_f32_m (not svmad_f32_m) so that inactive lanes preserve sum1 (=op1, the destination)
++        // rather than op2 (which is 0 from predicated svld1). Otherwise the partial tail corrupts accumulator lanes.
+         if (np2 < n) {
+             svbool_t pg = svwhilelt_b32(np2, n);
+             ax1 = svld1_f32(pg, x + np2);
+             ay1 = svld1_f32(pg, y + np2);
+-            sum1 = svmad_f32_m(pg, ax1, ay1, sum1);
++            sum1 = svmla_f32_m(pg, sum1, ax1, ay1);
+         }
+         // reduce sum1,sum2 to sum1
+         GGML_F32_VEC_REDUCE(sumf, sum1, sum2, sum3, sum4, sum5, sum6, sum7, sum8);
+@@ -696,7 +698,6 @@ void ggml_matmul_f16_4x4_kernel(size_t na, size_t nb, int dim,
+     // Each K_STEP=8: load 1 B vector, inner loop over M rows with f16 fma.
+     // Reduces B loads by (M-1)/M compared to N_remainder path (1 SVE dot per row).
+     if (N == 1) {
+-        // Accumulate in f32 directly to avoid fp16 range issues on large sums
+         for (size_t j = 0; j < M; j++) {
+             float16x8_t acc = vdupq_n_f16(0);
+ 
+@@ -707,17 +708,19 @@ void ggml_matmul_f16_4x4_kernel(size_t na, size_t nb, int dim,
+                 acc = vfmaq_f16(acc, a_v, b_v);
+             }
+ 
+-            float32_t sum = 0.0f;
+-            // Reduce: f16 accumulator -> f32 first, then horizontal add
+-            float32x4_t l = vcvt_f32_f16(vget_low_f16(acc));
+-            float32x4_t h = vcvt_f32_f16(vget_high_f16(acc));
+-            sum = vaddvq_f32(vaddq_f32(l, h));
+-
+-            // K tail: 1-7 fp16 elements, accumulate directly in f32
+-            for (; k < K; k++) {
+-                sum += ggml_fp16_to_fp32(A[j * K + k]) * ggml_fp16_to_fp32(B[k]);
++            if (k < K) {
++                svbool_t pg = svwhilelt_b16(k, K);
++                float16x8_t b_v = svget_neonq_f16(
++                    svld1_f16(pg, (const __fp16 *) &B[k]));
++                float16x8_t a_v = svget_neonq_f16(
++                    svld1_f16(pg, (const __fp16 *) &A[j * K + k]));
++                acc = vfmaq_f16(acc, a_v, b_v);
+             }
+ 
++            float32_t sum =
++                vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc))) +
++                vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc)));
++
+             C[j] = sum;
+         }
+ 
+@@ -1131,8 +1134,327 @@ matmul_outer_8x16_b_micro_packA_f32(size_t M,
+         }
+     }
+ }
++// Kunpeng 950 experimental NEON 16x4 kernel.
++//
++// Drop-in replacement for:
++//   matmul_outer_8x16_b_micro_packA_f16()
++//
++// External interface is intentionally unchanged.
++// The caller may still pass N in multiples of 8; this kernel processes N in
++// internal tiles of 4, so no outer dispatch change is required for A/B testing.
++//
++// Tile:
++//   M = 16
++//   N = 4
++//
++// Register layout:
++//   v16-v19 : B row 0..3, M[0..7]
++//   v20-v23 : B row 0..3, M[8..15]
++//
++// Compared with the existing 16x8 kernel:
++//   accumulators: 16 -> 8
++//   live B regs : 8  -> 4
++//
++// This leaves substantially more register/scheduler headroom for Kunpeng 950.
++
++void
++matmul_outer_4x16_b_micro_packA_f16(size_t M,
++                                    size_t N,
++                                    size_t K,
++                                    const void* a,
++                                    size_t a_column_bytes,
++                                    const void* b,
++                                    size_t b_column_bytes,
++                                    void* GGML_RESTRICT c,
++                                    size_t c_column_bytes)
++{
++    GGML_UNUSED(a_column_bytes);
+ 
++    const matmul_outer_pack_t* pack_a =
++        (const matmul_outer_pack_t*) a;
+ 
++    assert(M % 16 == 0 && N % 4 == 0);
++
++    float32_t* GGML_RESTRICT C = (float32_t*) c;
++    const float16_t* GGML_RESTRICT B = (const float16_t*) b;
++
++    const size_t c_stride = c_column_bytes / sizeof(float32_t);
++    const size_t b_stride = b_column_bytes / sizeof(float16_t);
++    const size_t a_stride = pack_a->p_stride / sizeof(float16_t);
++
++    const size_t a_stride_bytes = a_stride * sizeof(float16_t);
++    const size_t b_stride_bytes = b_stride * sizeof(float16_t);
++    const size_t c_stride_bytes = c_stride * sizeof(float32_t);
++
++    asm volatile(
++        "mov x1, #0\n"                         // i = 0
++        "mov x10, %[B]\n"                      // pb0
++
++        // ================================================================
++        // N loop, 4 rows per tile
++        // ================================================================
++        "1:\n"
++        "add x11, x10, %[b_stride]\n"
++        "add x12, x11, %[b_stride]\n"
++        "add x13, x12, %[b_stride]\n"
++
++        "mov x2, #0\n"                         // j = 0
++        "mov x3, %[pa]\n"                      // pa0 base
++
++        // ================================================================
++        // M loop, 16 cols
++        // ================================================================
++        "2:\n"
++        "add x4, x3, %[a_stride_lsl3]\n"       // pa1 base
++
++        "movi v16.16b, #0\n"
++        "movi v17.16b, #0\n"
++        "movi v18.16b, #0\n"
++        "movi v19.16b, #0\n"
++        "movi v20.16b, #0\n"
++        "movi v21.16b, #0\n"
++        "movi v22.16b, #0\n"
++        "movi v23.16b, #0\n"
++
++        // Incrementing packed-A pointers.
++        "mov x8, x3\n"                         // A low-half ptr
++        "mov x9, x4\n"                         // A high-half ptr
++        "mov x7, #0\n"                         // B byte offset
++
++        // Number of complete 8-K blocks (16 bytes each).
++        "lsr x14, %[K2], #4\n"
++        "cbz x14, 6f\n"
++
++        // Preload first A pair.
++        "ldr q8, [x8]\n"
++        "ldr q9, [x9]\n"
++
++        // ================================================================
++        // Main loop: 8 FP16 K values / iteration
++        // ================================================================
++        "3:\n"
++        // Load B vectors for this 8-K block.
++        "ldr q0, [x10, x7]\n"
++        "ldr q1, [x11, x7]\n"
++        "ldr q2, [x12, x7]\n"
++        "ldr q3, [x13, x7]\n"
++
++        // lane 0, current A in v8/v9
++        "fmla v16.8h, v8.8h, v0.h[0]\n"
++        "fmla v17.8h, v8.8h, v1.h[0]\n"
++        "fmla v18.8h, v8.8h, v2.h[0]\n"
++        "fmla v19.8h, v8.8h, v3.h[0]\n"
++        "fmla v20.8h, v9.8h, v0.h[0]\n"
++        "fmla v21.8h, v9.8h, v1.h[0]\n"
++        "fmla v22.8h, v9.8h, v2.h[0]\n"
++        "fmla v23.8h, v9.8h, v3.h[0]\n"
++
++        // Preload lane 1 A while lane 0 FMLAs retire.
++        "ldr q10, [x8, #16]\n"
++        "ldr q11, [x9, #16]\n"
++
++        // lane 1
++        "fmla v16.8h, v10.8h, v0.h[1]\n"
++        "fmla v17.8h, v10.8h, v1.h[1]\n"
++        "fmla v18.8h, v10.8h, v2.h[1]\n"
++        "fmla v19.8h, v10.8h, v3.h[1]\n"
++        "fmla v20.8h, v11.8h, v0.h[1]\n"
++        "fmla v21.8h, v11.8h, v1.h[1]\n"
++        "fmla v22.8h, v11.8h, v2.h[1]\n"
++        "fmla v23.8h, v11.8h, v3.h[1]\n"
++
++        // lane 2
++        "ldr q8, [x8, #32]\n"
++        "ldr q9, [x9, #32]\n"
++        "fmla v16.8h, v8.8h, v0.h[2]\n"
++        "fmla v17.8h, v8.8h, v1.h[2]\n"
++        "fmla v18.8h, v8.8h, v2.h[2]\n"
++        "fmla v19.8h, v8.8h, v3.h[2]\n"
++        "fmla v20.8h, v9.8h, v0.h[2]\n"
++        "fmla v21.8h, v9.8h, v1.h[2]\n"
++        "fmla v22.8h, v9.8h, v2.h[2]\n"
++        "fmla v23.8h, v9.8h, v3.h[2]\n"
++
++        // lane 3
++        "ldr q10, [x8, #48]\n"
++        "ldr q11, [x9, #48]\n"
++        "fmla v16.8h, v10.8h, v0.h[3]\n"
++        "fmla v17.8h, v10.8h, v1.h[3]\n"
++        "fmla v18.8h, v10.8h, v2.h[3]\n"
++        "fmla v19.8h, v10.8h, v3.h[3]\n"
++        "fmla v20.8h, v11.8h, v0.h[3]\n"
++        "fmla v21.8h, v11.8h, v1.h[3]\n"
++        "fmla v22.8h, v11.8h, v2.h[3]\n"
++        "fmla v23.8h, v11.8h, v3.h[3]\n"
++
++        // lane 4
++        "ldr q8, [x8, #64]\n"
++        "ldr q9, [x9, #64]\n"
++        "fmla v16.8h, v8.8h, v0.h[4]\n"
++        "fmla v17.8h, v8.8h, v1.h[4]\n"
++        "fmla v18.8h, v8.8h, v2.h[4]\n"
++        "fmla v19.8h, v8.8h, v3.h[4]\n"
++        "fmla v20.8h, v9.8h, v0.h[4]\n"
++        "fmla v21.8h, v9.8h, v1.h[4]\n"
++        "fmla v22.8h, v9.8h, v2.h[4]\n"
++        "fmla v23.8h, v9.8h, v3.h[4]\n"
++
++        // lane 5
++        "ldr q10, [x8, #80]\n"
++        "ldr q11, [x9, #80]\n"
++        "fmla v16.8h, v10.8h, v0.h[5]\n"
++        "fmla v17.8h, v10.8h, v1.h[5]\n"
++        "fmla v18.8h, v10.8h, v2.h[5]\n"
++        "fmla v19.8h, v10.8h, v3.h[5]\n"
++        "fmla v20.8h, v11.8h, v0.h[5]\n"
++        "fmla v21.8h, v11.8h, v1.h[5]\n"
++        "fmla v22.8h, v11.8h, v2.h[5]\n"
++        "fmla v23.8h, v11.8h, v3.h[5]\n"
++
++        // lane 6
++        "ldr q8, [x8, #96]\n"
++        "ldr q9, [x9, #96]\n"
++        "fmla v16.8h, v8.8h, v0.h[6]\n"
++        "fmla v17.8h, v8.8h, v1.h[6]\n"
++        "fmla v18.8h, v8.8h, v2.h[6]\n"
++        "fmla v19.8h, v8.8h, v3.h[6]\n"
++        "fmla v20.8h, v9.8h, v0.h[6]\n"
++        "fmla v21.8h, v9.8h, v1.h[6]\n"
++        "fmla v22.8h, v9.8h, v2.h[6]\n"
++        "fmla v23.8h, v9.8h, v3.h[6]\n"
++
++        // lane 7
++        "ldr q10, [x8, #112]\n"
++        "ldr q11, [x9, #112]\n"
++        "fmla v16.8h, v10.8h, v0.h[7]\n"
++        "fmla v17.8h, v10.8h, v1.h[7]\n"
++        "fmla v18.8h, v10.8h, v2.h[7]\n"
++        "fmla v19.8h, v10.8h, v3.h[7]\n"
++        "fmla v20.8h, v11.8h, v0.h[7]\n"
++        "fmla v21.8h, v11.8h, v1.h[7]\n"
++        "fmla v22.8h, v11.8h, v2.h[7]\n"
++        "fmla v23.8h, v11.8h, v3.h[7]\n"
++
++        // Advance to next 8-K block.
++        "add x8, x8, #128\n"
++        "add x9, x9, #128\n"
++        "add x7, x7, #16\n"
++
++        "subs x14, x14, #1\n"
++        "b.eq 6f\n"
++
++        // Preload next block's lane 0 A so next iteration starts ready.
++        "ldr q8, [x8]\n"
++        "ldr q9, [x9]\n"
++        "b 3b\n"
++
++        // ================================================================
++        // Scalar tail: if K is not multiple of 8.
++        // x7 is current B byte offset.
++        // x8/x9 already point to matching packed-A offset.
++        // ================================================================
++        "6:\n"
++        "cmp x7, %[K2]\n"
++        "b.hs 7f\n"
++
++        "5:\n"
++        "ldr h0, [x10, x7]\n"
++        "ldr h1, [x11, x7]\n"
++        "ldr h2, [x12, x7]\n"
++        "ldr h3, [x13, x7]\n"
++
++        "ldr q8, [x8]\n"
++        "ldr q9, [x9]\n"
++
++        "fmla v16.8h, v8.8h, v0.h[0]\n"
++        "fmla v17.8h, v8.8h, v1.h[0]\n"
++        "fmla v18.8h, v8.8h, v2.h[0]\n"
++        "fmla v19.8h, v8.8h, v3.h[0]\n"
++        "fmla v20.8h, v9.8h, v0.h[0]\n"
++        "fmla v21.8h, v9.8h, v1.h[0]\n"
++        "fmla v22.8h, v9.8h, v2.h[0]\n"
++        "fmla v23.8h, v9.8h, v3.h[0]\n"
++
++        "add x7, x7, #2\n"
++        "add x8, x8, #16\n"
++        "add x9, x9, #16\n"
++        "cmp x7, %[K2]\n"
++        "b.lo 5b\n"
++
++        // ================================================================
++        // Store 4 x 16 FP32
++        // ================================================================
++        "7:\n"
++        "lsl x5, x2, #2\n"
++        "add x5, x5, %[C]\n"
++
++#define STORE_16X4_ROW(LO, HI)                                      \
++        "fcvtl v0.4s, v" #LO ".4h\n"                               \
++        "fcvtl2 v1.4s, v" #LO ".8h\n"                              \
++        "stp q0, q1, [x5, #0]\n"                                   \
++        "fcvtl v0.4s, v" #HI ".4h\n"                               \
++        "fcvtl2 v1.4s, v" #HI ".8h\n"                              \
++        "stp q0, q1, [x5, #32]\n"
++
++        STORE_16X4_ROW(16, 20)
++        "add x5, x5, %[c_stride]\n"
++
++        STORE_16X4_ROW(17, 21)
++        "add x5, x5, %[c_stride]\n"
++
++        STORE_16X4_ROW(18, 22)
++        "add x5, x5, %[c_stride]\n"
++
++        STORE_16X4_ROW(19, 23)
++
++#undef STORE_16X4_ROW
++
++        // Next M tile.
++        "add x3, x3, %[a_stride_lsl4]\n"
++        "add x2, x2, #16\n"
++        "cmp x2, %[M]\n"
++        "b.cc 2b\n"
++
++        // Next N tile, 4 rows.
++        "add %[C], %[C], %[c_stride_lsl2]\n"
++        "add x10, x10, %[b_stride_lsl2]\n"
++
++        "add x1, x1, #4\n"
++        "cmp x1, %[N]\n"
++        "b.cc 1b\n"
++
++        : [C] "+r"(C)
++        : [N] "r"(N),
++          [M] "r"(M),
++          [K2] "r"(K * 2),
++          [B] "r"(B),
++          [pa] "r"(pack_a->p),
++          [a_stride_lsl3] "r"(a_stride_bytes * 8),
++          [a_stride_lsl4] "r"(a_stride_bytes * 16),
++          [b_stride] "r"(b_stride_bytes),
++          [b_stride_lsl2] "r"(b_stride_bytes * 4),
++          [c_stride] "r"(c_stride_bytes),
++          [c_stride_lsl2] "r"(c_stride_bytes * 4)
++        : "memory", "cc",
++          "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++          "x10", "x11", "x12", "x13", "x14",
++          "v0", "v1", "v2", "v3",
++          "v8", "v9", "v10", "v11",
++          "v16", "v17", "v18", "v19",
++          "v20", "v21", "v22", "v23"
++    );
++}
++// Kunpeng 950 software-pipelined variant:
++// - Uses v16-v31 for all 16 accumulators, so only v8-v11 are callee-saved.
++//   This removes the save/restore of d12-d15 from the generated prologue/epilogue.
++// - Contains no software PRFM. Verify the rebuilt disassembly also contains none.
++// - Removes the 10 inner-loop software prefetch instructions.
++// - Delays the second packed-A half load and overlaps it with first-half FMLA.
++// - Splits B loads into 4+4 groups and interleaves them with FMLA.
++// - Reuses packed-A addresses for the second 8K sub-block.
++// - Uses a precomputed countdown for the 32-byte main K loop, eliminating
++//   the per-iteration add/cmp/exit-branch sequence.
++// - Keeps arithmetic order, tile shape, packing format and tail handling.
+ void
+ matmul_outer_8x16_b_micro_packA_f16(size_t M,
+                                     size_t N,
+@@ -1152,43 +1474,30 @@ matmul_outer_8x16_b_micro_packA_f16(size_t M,
+     size_t c_stride = c_column_bytes / sizeof(float32_t);
+     size_t b_stride = b_column_bytes / sizeof(float16_t);
+     size_t a_stride = pack_a->p_stride / sizeof(float16_t);
+-    size_t a_stride_bytes = a_stride * sizeof(float16_t);
+-    size_t b_stride_bytes = b_stride * sizeof(float16_t);
+-    size_t c_stride_bytes = c_stride * sizeof(float32_t);
++
++    const size_t a_stride_bytes = a_stride * sizeof(float16_t);
++    const size_t b_stride_bytes = b_stride * sizeof(float16_t);
++    const size_t c_stride_bytes = c_stride * sizeof(float32_t);
++
+     asm volatile(
+-            // Initialize i=0, pb0=B
+-            "mov x1, #0\n"
+-            "mov x10, %[B]\n"
+-
+-            // ===== Outer loop: N dimension, step 8 =====
+-            "1:\n"
+-            // Compute pb1..pb7 from pb0
+-            "add x11, x10, %[b_stride_bytes]\n"
+-            "add x12, x11, %[b_stride_bytes]\n"
+-            "add x13, x12, %[b_stride_bytes]\n"
+-            "add x14, x13, %[b_stride_bytes]\n"
+-            "add x15, x14, %[b_stride_bytes]\n"
+-            "add x16, x15, %[b_stride_bytes]\n"
+-            "add x17, x16, %[b_stride_bytes]\n"
+-
+-            // Prefetch B data for this N-block
+-            "prfm PLDL1KEEP, [x10, #0]\n"
+-            "prfm PLDL1KEEP, [x11, #0]\n"
+-            "prfm PLDL1KEEP, [x12, #0]\n"
+-            "prfm PLDL1KEEP, [x13, #0]\n"
+-            "prfm PLDL1KEEP, [x14, #0]\n"
+-            "prfm PLDL1KEEP, [x15, #0]\n"
+-            "prfm PLDL1KEEP, [x16, #0]\n"
+-            "prfm PLDL1KEEP, [x17, #0]\n"
+-
+-            "mov x2, #0\n" // j = 0
+-            "mov x3, %[pa]\n" // pa0 = pa
+-
+-            // ===== Middle loop: M dimension, step 16 =====
+-            "2:\n"
+-            "add x4, x3, %[a_stride_bytes_lsl3]\n" // pa1 = pa0 + 8 * a_stride_bytes
+-
+-            // Zero all 16 accumulators (acc0..7 for row group 0, acc8..15 for row group 1)
++            "mov x1, #0\n"                     // i = 0
++            "mov x10, %[B]\n"                  // pb0 = &B[0]
++
++            "1:\n"                             // for i..N, step=8
++            "add x11, x10, %[b_stride]\n"      // pb1 = pb0 + b_stride
++            "add x12, x11, %[b_stride]\n"
++            "add x13, x12, %[b_stride]\n"
++            "add x14, x13, %[b_stride]\n"
++            "add x15, x14, %[b_stride]\n"
++            "add x16, x15, %[b_stride]\n"
++            "add x17, x16, %[b_stride]\n"
++
++            "mov x2, #0\n"                     // j = 0
++            "mov x3, %[pa]\n"                  // pa0 = pa
++
++            "2:\n"                             // for j..M, step=16
++            "add x4, x3, %[a_stride_lsl3]\n"   // pa1 = pa0 + 8 * a_stride_bytes
++
+             "movi v16.16b, #0\n"
+             "movi v17.16b, #0\n"
+             "movi v18.16b, #0\n"
+@@ -1206,472 +1515,292 @@ matmul_outer_8x16_b_micro_packA_f16(size_t M,
+             "movi v30.16b, #0\n"
+             "movi v31.16b, #0\n"
+ 
+-            "mov x7, #0\n" // k2 = 0 (byte offset into B)
+-
+-            // ===== Inner loop: K dimension, step 32 bytes (16 fp16) =====
+-            // Check if we have enough K for the main loop (K2 >= 32)
+-            "cmp %[K2], #32\n"
+-            "b.lt 5f\n"
+-
+-            // ==== Pre-load first iteration's data ====
+-            "lsl x6, x7, #3\n add x8, x3, x6\n"  // pak0 = pa0 + k2*8
+-            "add x9, x4, x6\n"                     // pak1 = pa1 + k2*8
+-            "ldp q0, q2, [x8, #(0 * 16)]\n"       // a0M1_0, a0M2_0
+-            "ldp q1, q3, [x9, #(0 * 16)]\n"       // a1M1_0, a1M2_0
+-            "ldp q4, q6, [x8, #(2 * 16)]\n"       // a0M1_1, a0M2_1 (next 16 bytes)
+-            "ldp q5, q7, [x9, #(2 * 16)]\n"       // a1M1_1, a1M2_1
+-
+-            "ldr q8, [x10, x7]\n"
+-            "ldr q9, [x11, x7]\n"
+-            "ldr q10, [x12, x7]\n"
+-            "ldr q11, [x13, x7]\n"
+-            "ldr q12, [x14, x7]\n"
+-            "ldr q13, [x15, x7]\n"
+-            "ldr q14, [x16, x7]\n"
+-            "ldr q15, [x17, x7]\n"
+-
+-            "add x7, x7, #32\n" // k2 += 32
+-
+-            // Main loop: each iteration processes 32 bytes of K
++            "mov x7, #0\n"                     // k2 = byte offset into B
++            "lsr x18, %[K2], #5\n"            // number of complete 32-byte K chunks
++            "cbz x18, 7f\n"
++
++            // ==== main unroll2 loop: exactly floor(K2 / 32) iterations ====
+             "3:\n"
+-            "add x6, x7, #32\n"
++
++            // Inner-loop PRFM removed permanently to reduce frontend/LSU pressure.
++
++#define KERNEL_8x8_M_D(idx, rl1, rl2, rc1, rc2)                    \
++            "ldr q" #rl1 ", [x8, #((" #idx " + 1) * 16)]\n"      \
++            "ldr q" #rl2 ", [x9, #((" #idx " + 1) * 16)]\n"      \
++            /* Interleave low/high M accumulators to spread rename/issue pressure. */ \
++            "fmla v16.8h, v" #rc1 ".8h, v0.h[" #idx "]\n"       \
++            "fmla v24.8h, v" #rc2 ".8h, v0.h[" #idx "]\n"       \
++            "fmla v17.8h, v" #rc1 ".8h, v1.h[" #idx "]\n"       \
++            "fmla v25.8h, v" #rc2 ".8h, v1.h[" #idx "]\n"       \
++            "fmla v18.8h, v" #rc1 ".8h, v2.h[" #idx "]\n"       \
++            "fmla v26.8h, v" #rc2 ".8h, v2.h[" #idx "]\n"       \
++            "fmla v19.8h, v" #rc1 ".8h, v3.h[" #idx "]\n"       \
++            "fmla v27.8h, v" #rc2 ".8h, v3.h[" #idx "]\n"       \
++            "fmla v20.8h, v" #rc1 ".8h, v4.h[" #idx "]\n"       \
++            "fmla v28.8h, v" #rc2 ".8h, v4.h[" #idx "]\n"       \
++            "fmla v21.8h, v" #rc1 ".8h, v5.h[" #idx "]\n"       \
++            "fmla v29.8h, v" #rc2 ".8h, v5.h[" #idx "]\n"       \
++            "fmla v22.8h, v" #rc1 ".8h, v6.h[" #idx "]\n"       \
++            "fmla v30.8h, v" #rc2 ".8h, v6.h[" #idx "]\n"       \
++            "fmla v23.8h, v" #rc1 ".8h, v7.h[" #idx "]\n"       \
++            "fmla v31.8h, v" #rc2 ".8h, v7.h[" #idx "]\n"
++
++#define KERNEL_BODY_8K_D()                                          \
++            /* Load the first M-half only; delay the second M-half load. */ \
++            "ldp q8, q10, [x8, #(0 * 16)]\n"                        \
++            "ldr q0, [x10, x6]\n"                                   \
++            "ldr q1, [x11, x6]\n"                                   \
++            "ldr q2, [x12, x6]\n"                                   \
++            "ldr q3, [x13, x6]\n"                                   \
++            "fmla v16.8h, v8.8h, v0.h[0]\n"                        \
++            "fmla v17.8h, v8.8h, v1.h[0]\n"                        \
++            "fmla v18.8h, v8.8h, v2.h[0]\n"                        \
++            "fmla v19.8h, v8.8h, v3.h[0]\n"                        \
++            /* q9/q11 now overlap with first-half FMLA retirement. */ \
++            "ldp q9, q11, [x9, #(0 * 16)]\n"                        \
++            "fmla v24.8h, v9.8h, v0.h[0]\n"                        \
++            "fmla v25.8h, v9.8h, v1.h[0]\n"                        \
++            "fmla v26.8h, v9.8h, v2.h[0]\n"                        \
++            "fmla v27.8h, v9.8h, v3.h[0]\n"                        \
++            "ldr q4, [x14, x6]\n"                                   \
++            "ldr q5, [x15, x6]\n"                                   \
++            "ldr q6, [x16, x6]\n"                                   \
++            "ldr q7, [x17, x6]\n"                                   \
++            "fmla v20.8h, v8.8h, v4.h[0]\n"                        \
++            "fmla v21.8h, v8.8h, v5.h[0]\n"                        \
++            "fmla v22.8h, v8.8h, v6.h[0]\n"                        \
++            "fmla v23.8h, v8.8h, v7.h[0]\n"                        \
++            "fmla v28.8h, v9.8h, v4.h[0]\n"                        \
++            "fmla v29.8h, v9.8h, v5.h[0]\n"                        \
++            "fmla v30.8h, v9.8h, v6.h[0]\n"                        \
++            "fmla v31.8h, v9.8h, v7.h[0]\n"                        \
++            KERNEL_8x8_M_D(1,  8,  9, 10, 11)                       \
++            KERNEL_8x8_M_D(2, 10, 11,  8,  9)                       \
++            KERNEL_8x8_M_D(3,  8,  9, 10, 11)                       \
++            KERNEL_8x8_M_D(4, 10, 11,  8,  9)                       \
++            KERNEL_8x8_M_D(5,  8,  9, 10, 11)                       \
++            KERNEL_8x8_M_D(6, 10, 11,  8,  9)                       \
++            "fmla v16.8h, v10.8h, v0.h[7]\n"                       \
++            "fmla v17.8h, v10.8h, v1.h[7]\n"                       \
++            "fmla v18.8h, v10.8h, v2.h[7]\n"                       \
++            "fmla v19.8h, v10.8h, v3.h[7]\n"                       \
++            "fmla v20.8h, v10.8h, v4.h[7]\n"                       \
++            "fmla v21.8h, v10.8h, v5.h[7]\n"                       \
++            "fmla v22.8h, v10.8h, v6.h[7]\n"                       \
++            "fmla v23.8h, v10.8h, v7.h[7]\n"                       \
++            "fmla v24.8h, v11.8h, v0.h[7]\n"                       \
++            "fmla v25.8h, v11.8h, v1.h[7]\n"                       \
++            "fmla v26.8h, v11.8h, v2.h[7]\n"                       \
++            "fmla v27.8h, v11.8h, v3.h[7]\n"                       \
++            "fmla v28.8h, v11.8h, v4.h[7]\n"                       \
++            "fmla v29.8h, v11.8h, v5.h[7]\n"                       \
++            "fmla v30.8h, v11.8h, v6.h[7]\n"                       \
++            "fmla v31.8h, v11.8h, v7.h[7]\n"
++
++            // First 8K sub-block: calculate packed-A addresses once.
++            "lsl x6, x7, #3\n"
++            "add x8, x3, x6\n"
++            "add x9, x4, x6\n"
++            "mov x6, x7\n"
++            KERNEL_BODY_8K_D()
++
++            // Second 8K sub-block: fixed increments replace add/lsl/add.
++            "add x8, x8, #128\n"
++            "add x9, x9, #128\n"
++            "add x6, x7, #16\n"
++            KERNEL_BODY_8K_D()
++
++#undef KERNEL_BODY_8K_D
++#undef KERNEL_8x8_M_D
++
++            "add x7, x7, #32\n"
++            "subs x18, x18, #1\n"
++            "b.ne 3b\n"
++
++            // ==== remainder full block loop: for (; k2 + 16 <= K2; k2 += 16) ====
++            "7:\n"
++            "add x6, x7, #16\n"
+             "cmp x6, %[K2]\n"
+             "b.hi 4f\n"
+ 
+-            // ==== Software-pipelined kernel: compute with previous data, load next ====
+-            // --- idx=0 (v0,v1 from A, v8..v15 from B, lane 0) ---
+-            "fmla v16.8h, v0.8h, v8.h[0]\n"
+-            "fmla v17.8h, v0.8h, v9.h[0]\n"
+-            "fmla v18.8h, v0.8h, v10.h[0]\n"
+-            "fmla v19.8h, v0.8h, v11.h[0]\n"
+-            "fmla v20.8h, v0.8h, v12.h[0]\n"
+-            "fmla v21.8h, v0.8h, v13.h[0]\n"
+-            "fmla v22.8h, v0.8h, v14.h[0]\n"
+-            "fmla v23.8h, v0.8h, v15.h[0]\n"
+-            "fmla v24.8h, v1.8h, v8.h[0]\n"
+-            "fmla v25.8h, v1.8h, v9.h[0]\n"
+-            "fmla v26.8h, v1.8h, v10.h[0]\n"
+-            "fmla v27.8h, v1.8h, v11.h[0]\n"
+-            "fmla v28.8h, v1.8h, v12.h[0]\n"
+-            "fmla v29.8h, v1.8h, v13.h[0]\n"
+-            "fmla v30.8h, v1.8h, v14.h[0]\n"
+-            "fmla v31.8h, v1.8h, v15.h[0]\n"
+-
+-            // --- idx=1: load next A (part 1), compute with previous (lane 1) ---
+-            "ldp q0, q2, [x8, #(4 * 16)]\n"
+-            "fmla v16.8h, v4.8h, v8.h[1]\n"
+-            "fmla v17.8h, v4.8h, v9.h[1]\n"
+-            "fmla v18.8h, v4.8h, v10.h[1]\n"
+-            "fmla v19.8h, v4.8h, v11.h[1]\n"
+-            "fmla v20.8h, v4.8h, v12.h[1]\n"
+-            "fmla v21.8h, v4.8h, v13.h[1]\n"
+-            "fmla v22.8h, v4.8h, v14.h[1]\n"
+-            "fmla v23.8h, v4.8h, v15.h[1]\n"
+-            "fmla v24.8h, v5.8h, v8.h[1]\n"
+-            "fmla v25.8h, v5.8h, v9.h[1]\n"
+-            "fmla v26.8h, v5.8h, v10.h[1]\n"
+-            "fmla v27.8h, v5.8h, v11.h[1]\n"
+-            "fmla v28.8h, v5.8h, v12.h[1]\n"
+-            "fmla v29.8h, v5.8h, v13.h[1]\n"
+-            "fmla v30.8h, v5.8h, v14.h[1]\n"
+-            "fmla v31.8h, v5.8h, v15.h[1]\n"
+-
+-            // --- idx=2: load next A (part 2), compute ---
+-            "ldp q1, q3, [x9, #(4 * 16)]\n"
+-            "fmla v16.8h, v0.8h, v8.h[2]\n"
+-            "fmla v17.8h, v0.8h, v9.h[2]\n"
+-            "fmla v18.8h, v0.8h, v10.h[2]\n"
+-            "fmla v19.8h, v0.8h, v11.h[2]\n"
+-            "fmla v20.8h, v0.8h, v12.h[2]\n"
+-            "fmla v21.8h, v0.8h, v13.h[2]\n"
+-            "fmla v22.8h, v0.8h, v14.h[2]\n"
+-            "fmla v23.8h, v0.8h, v15.h[2]\n"
+-            "fmla v24.8h, v1.8h, v8.h[2]\n"
+-            "fmla v25.8h, v1.8h, v9.h[2]\n"
+-            "fmla v26.8h, v1.8h, v10.h[2]\n"
+-            "fmla v27.8h, v1.8h, v11.h[2]\n"
+-            "fmla v28.8h, v1.8h, v12.h[2]\n"
+-            "fmla v29.8h, v1.8h, v13.h[2]\n"
+-            "fmla v30.8h, v1.8h, v14.h[2]\n"
+-            "fmla v31.8h, v1.8h, v15.h[2]\n"
+-
+-            // --- idx=3 ---
+-            "ldp q4, q6, [x8, #(6 * 16)]\n"
+-            "fmla v16.8h, v2.8h, v8.h[3]\n"
+-            "fmla v17.8h, v2.8h, v9.h[3]\n"
+-            "fmla v18.8h, v2.8h, v10.h[3]\n"
+-            "fmla v19.8h, v2.8h, v11.h[3]\n"
+-            "fmla v20.8h, v2.8h, v12.h[3]\n"
+-            "fmla v21.8h, v2.8h, v13.h[3]\n"
+-            "fmla v22.8h, v2.8h, v14.h[3]\n"
+-            "fmla v23.8h, v2.8h, v15.h[3]\n"
+-            "fmla v24.8h, v3.8h, v8.h[3]\n"
+-            "fmla v25.8h, v3.8h, v9.h[3]\n"
+-            "fmla v26.8h, v3.8h, v10.h[3]\n"
+-            "fmla v27.8h, v3.8h, v11.h[3]\n"
+-            "fmla v28.8h, v3.8h, v12.h[3]\n"
+-            "fmla v29.8h, v3.8h, v13.h[3]\n"
+-            "fmla v30.8h, v3.8h, v14.h[3]\n"
+-            "fmla v31.8h, v3.8h, v15.h[3]\n"
+-
+-            // --- idx=4 ---
+-            "ldp q5, q7, [x9, #(6 * 16)]\n"
+-            "fmla v16.8h, v4.8h, v8.h[4]\n"
+-            "fmla v17.8h, v4.8h, v9.h[4]\n"
+-            "fmla v18.8h, v4.8h, v10.h[4]\n"
+-            "fmla v19.8h, v4.8h, v11.h[4]\n"
+-            "fmla v20.8h, v4.8h, v12.h[4]\n"
+-            "fmla v21.8h, v4.8h, v13.h[4]\n"
+-            "fmla v22.8h, v4.8h, v14.h[4]\n"
+-            "fmla v23.8h, v4.8h, v15.h[4]\n"
+-            "fmla v24.8h, v5.8h, v8.h[4]\n"
+-            "fmla v25.8h, v5.8h, v9.h[4]\n"
+-            "fmla v26.8h, v5.8h, v10.h[4]\n"
+-            "fmla v27.8h, v5.8h, v11.h[4]\n"
+-            "fmla v28.8h, v5.8h, v12.h[4]\n"
+-            "fmla v29.8h, v5.8h, v13.h[4]\n"
+-            "fmla v30.8h, v5.8h, v14.h[4]\n"
+-            "fmla v31.8h, v5.8h, v15.h[4]\n"
+-
+-            // --- idx=5 ---
+-            "ldp q0, q2, [x8, #(8 * 16)]\n"
+-            "fmla v16.8h, v6.8h, v8.h[5]\n"
+-            "fmla v17.8h, v6.8h, v9.h[5]\n"
+-            "fmla v18.8h, v6.8h, v10.h[5]\n"
+-            "fmla v19.8h, v6.8h, v11.h[5]\n"
+-            "fmla v20.8h, v6.8h, v12.h[5]\n"
+-            "fmla v21.8h, v6.8h, v13.h[5]\n"
+-            "fmla v22.8h, v6.8h, v14.h[5]\n"
+-            "fmla v23.8h, v6.8h, v15.h[5]\n"
+-            "fmla v24.8h, v7.8h, v8.h[5]\n"
+-            "fmla v25.8h, v7.8h, v9.h[5]\n"
+-            "fmla v26.8h, v7.8h, v10.h[5]\n"
+-            "fmla v27.8h, v7.8h, v11.h[5]\n"
+-            "fmla v28.8h, v7.8h, v12.h[5]\n"
+-            "fmla v29.8h, v7.8h, v13.h[5]\n"
+-            "fmla v30.8h, v7.8h, v14.h[5]\n"
+-            "fmla v31.8h, v7.8h, v15.h[5]\n"
+-
+-            // --- idx=6 ---
+-            "ldp q1, q3, [x9, #(8 * 16)]\n"
+-            "fmla v16.8h, v0.8h, v8.h[6]\n"
+-            "fmla v17.8h, v0.8h, v9.h[6]\n"
+-            "fmla v18.8h, v0.8h, v10.h[6]\n"
+-            "fmla v19.8h, v0.8h, v11.h[6]\n"
+-            "fmla v20.8h, v0.8h, v12.h[6]\n"
+-            "fmla v21.8h, v0.8h, v13.h[6]\n"
+-            "fmla v22.8h, v0.8h, v14.h[6]\n"
+-            "fmla v23.8h, v0.8h, v15.h[6]\n"
+-            "fmla v24.8h, v1.8h, v8.h[6]\n"
+-            "fmla v25.8h, v1.8h, v9.h[6]\n"
+-            "fmla v26.8h, v1.8h, v10.h[6]\n"
+-            "fmla v27.8h, v1.8h, v11.h[6]\n"
+-            "fmla v28.8h, v1.8h, v12.h[6]\n"
+-            "fmla v29.8h, v1.8h, v13.h[6]\n"
+-            "fmla v30.8h, v1.8h, v14.h[6]\n"
+-            "fmla v31.8h, v1.8h, v15.h[6]\n"
+-
+-            // --- idx=7 ---
+-            // Prefetch next iteration's data
+-            "lsl x6, x7, #3\n add x8, x3, x6\n"  // pak0 = pa0 + k2*8
+-            "add x9, x4, x6\n"                     // pak1 = pa1 + k2*8
+-            "prfm PLDL1KEEP, [x8, #(0 * 16)]\n"
+-            "prfm PLDL1KEEP, [x9, #(0 * 16)]\n"
+-            "prfm PLDL1KEEP, [x10, x7]\n"
+-            "prfm PLDL1KEEP, [x11, x7]\n"
+-            "prfm PLDL1KEEP, [x12, x7]\n"
+-            "prfm PLDL1KEEP, [x13, x7]\n"
+-            "prfm PLDL1KEEP, [x14, x7]\n"
+-            "prfm PLDL1KEEP, [x15, x7]\n"
+-            "prfm PLDL1KEEP, [x16, x7]\n"
+-            "prfm PLDL1KEEP, [x17, x7]\n"
+-            "fmla v16.8h, v2.8h, v8.h[7]\n"
+-            "fmla v17.8h, v2.8h, v9.h[7]\n"
+-            "fmla v18.8h, v2.8h, v10.h[7]\n"
+-            "fmla v19.8h, v2.8h, v11.h[7]\n"
+-            "fmla v20.8h, v2.8h, v12.h[7]\n"
+-            "fmla v21.8h, v2.8h, v13.h[7]\n"
+-            "fmla v22.8h, v2.8h, v14.h[7]\n"
+-            "fmla v23.8h, v2.8h, v15.h[7]\n"
+-            "fmla v24.8h, v3.8h, v8.h[7]\n"
+-            "fmla v25.8h, v3.8h, v9.h[7]\n"
+-            "fmla v26.8h, v3.8h, v10.h[7]\n"
+-            "fmla v27.8h, v3.8h, v11.h[7]\n"
+-            "fmla v28.8h, v3.8h, v12.h[7]\n"
+-            "fmla v29.8h, v3.8h, v13.h[7]\n"
+-            "fmla v30.8h, v3.8h, v14.h[7]\n"
+-            "fmla v31.8h, v3.8h, v15.h[7]\n"
+-
+-            // Load next iteration's data
+-            "ldp q0, q2, [x8, #(0 * 16)]\n"
+-            "ldp q1, q3, [x9, #(0 * 16)]\n"
+-            "ldp q4, q6, [x8, #(2 * 16)]\n"
+-            "ldp q5, q7, [x9, #(2 * 16)]\n"
+-            "ldr q8, [x10, x7]\n"
+-            "ldr q9, [x11, x7]\n"
+-            "ldr q10, [x12, x7]\n"
+-            "ldr q11, [x13, x7]\n"
+-            "ldr q12, [x14, x7]\n"
+-            "ldr q13, [x15, x7]\n"
+-            "ldr q14, [x16, x7]\n"
+-            "ldr q15, [x17, x7]\n"
+-
+-            "add x7, x7, #32\n" // k2 += 32
+-            "b 3b\n"
+-
+-            // ==== Epilogue: process last partial iteration ====
+-            "4:\n"
+-            // --- idx=0 ---
+-            "fmla v16.8h, v0.8h, v8.h[0]\n"
+-            "fmla v17.8h, v0.8h, v9.h[0]\n"
+-            "fmla v18.8h, v0.8h, v10.h[0]\n"
+-            "fmla v19.8h, v0.8h, v11.h[0]\n"
+-            "fmla v20.8h, v0.8h, v12.h[0]\n"
+-            "fmla v21.8h, v0.8h, v13.h[0]\n"
+-            "fmla v22.8h, v0.8h, v14.h[0]\n"
+-            "fmla v23.8h, v0.8h, v15.h[0]\n"
+-            "fmla v24.8h, v1.8h, v8.h[0]\n"
+-            "fmla v25.8h, v1.8h, v9.h[0]\n"
+-            "fmla v26.8h, v1.8h, v10.h[0]\n"
+-            "fmla v27.8h, v1.8h, v11.h[0]\n"
+-            "fmla v28.8h, v1.8h, v12.h[0]\n"
+-            "fmla v29.8h, v1.8h, v13.h[0]\n"
+-            "fmla v30.8h, v1.8h, v14.h[0]\n"
+-            "fmla v31.8h, v1.8h, v15.h[0]\n"
+-
+-            "fmla v16.8h, v4.8h, v8.h[1]\n"
+-            "fmla v17.8h, v4.8h, v9.h[1]\n"
+-            "fmla v18.8h, v4.8h, v10.h[1]\n"
+-            "fmla v19.8h, v4.8h, v11.h[1]\n"
+-            "fmla v20.8h, v4.8h, v12.h[1]\n"
+-            "fmla v21.8h, v4.8h, v13.h[1]\n"
+-            "fmla v22.8h, v4.8h, v14.h[1]\n"
+-            "fmla v23.8h, v4.8h, v15.h[1]\n"
+-            "fmla v24.8h, v5.8h, v8.h[1]\n"
+-            "fmla v25.8h, v5.8h, v9.h[1]\n"
+-            "fmla v26.8h, v5.8h, v10.h[1]\n"
+-            "fmla v27.8h, v5.8h, v11.h[1]\n"
+-            "fmla v28.8h, v5.8h, v12.h[1]\n"
+-            "fmla v29.8h, v5.8h, v13.h[1]\n"
+-            "fmla v30.8h, v5.8h, v14.h[1]\n"
+-            "fmla v31.8h, v5.8h, v15.h[1]\n"
+-
+-            "fmla v16.8h, v0.8h, v8.h[2]\n"
+-            "fmla v17.8h, v0.8h, v9.h[2]\n"
+-            "fmla v18.8h, v0.8h, v10.h[2]\n"
+-            "fmla v19.8h, v0.8h, v11.h[2]\n"
+-            "fmla v20.8h, v0.8h, v12.h[2]\n"
+-            "fmla v21.8h, v0.8h, v13.h[2]\n"
+-            "fmla v22.8h, v0.8h, v14.h[2]\n"
+-            "fmla v23.8h, v0.8h, v15.h[2]\n"
+-            "fmla v24.8h, v1.8h, v8.h[2]\n"
+-            "fmla v25.8h, v1.8h, v9.h[2]\n"
+-            "fmla v26.8h, v1.8h, v10.h[2]\n"
+-            "fmla v27.8h, v1.8h, v11.h[2]\n"
+-            "fmla v28.8h, v1.8h, v12.h[2]\n"
+-            "fmla v29.8h, v1.8h, v13.h[2]\n"
+-            "fmla v30.8h, v1.8h, v14.h[2]\n"
+-            "fmla v31.8h, v1.8h, v15.h[2]\n"
+-
+-            "fmla v16.8h, v2.8h, v8.h[3]\n"
+-            "fmla v17.8h, v2.8h, v9.h[3]\n"
+-            "fmla v18.8h, v2.8h, v10.h[3]\n"
+-            "fmla v19.8h, v2.8h, v11.h[3]\n"
+-            "fmla v20.8h, v2.8h, v12.h[3]\n"
+-            "fmla v21.8h, v2.8h, v13.h[3]\n"
+-            "fmla v22.8h, v2.8h, v14.h[3]\n"
+-            "fmla v23.8h, v2.8h, v15.h[3]\n"
+-            "fmla v24.8h, v3.8h, v8.h[3]\n"
+-            "fmla v25.8h, v3.8h, v9.h[3]\n"
+-            "fmla v26.8h, v3.8h, v10.h[3]\n"
+-            "fmla v27.8h, v3.8h, v11.h[3]\n"
+-            "fmla v28.8h, v3.8h, v12.h[3]\n"
+-            "fmla v29.8h, v3.8h, v13.h[3]\n"
+-            "fmla v30.8h, v3.8h, v14.h[3]\n"
+-            "fmla v31.8h, v3.8h, v15.h[3]\n"
+-
+-            "fmla v16.8h, v4.8h, v8.h[4]\n"
+-            "fmla v17.8h, v4.8h, v9.h[4]\n"
+-            "fmla v18.8h, v4.8h, v10.h[4]\n"
+-            "fmla v19.8h, v4.8h, v11.h[4]\n"
+-            "fmla v20.8h, v4.8h, v12.h[4]\n"
+-            "fmla v21.8h, v4.8h, v13.h[4]\n"
+-            "fmla v22.8h, v4.8h, v14.h[4]\n"
+-            "fmla v23.8h, v4.8h, v15.h[4]\n"
+-            "fmla v24.8h, v5.8h, v8.h[4]\n"
+-            "fmla v25.8h, v5.8h, v9.h[4]\n"
+-            "fmla v26.8h, v5.8h, v10.h[4]\n"
+-            "fmla v27.8h, v5.8h, v11.h[4]\n"
+-            "fmla v28.8h, v5.8h, v12.h[4]\n"
+-            "fmla v29.8h, v5.8h, v13.h[4]\n"
+-            "fmla v30.8h, v5.8h, v14.h[4]\n"
+-            "fmla v31.8h, v5.8h, v15.h[4]\n"
+-
+-            "fmla v16.8h, v6.8h, v8.h[5]\n"
+-            "fmla v17.8h, v6.8h, v9.h[5]\n"
+-            "fmla v18.8h, v6.8h, v10.h[5]\n"
+-            "fmla v19.8h, v6.8h, v11.h[5]\n"
+-            "fmla v20.8h, v6.8h, v12.h[5]\n"
+-            "fmla v21.8h, v6.8h, v13.h[5]\n"
+-            "fmla v22.8h, v6.8h, v14.h[5]\n"
+-            "fmla v23.8h, v6.8h, v15.h[5]\n"
+-            "fmla v24.8h, v7.8h, v8.h[5]\n"
+-            "fmla v25.8h, v7.8h, v9.h[5]\n"
+-            "fmla v26.8h, v7.8h, v10.h[5]\n"
+-            "fmla v27.8h, v7.8h, v11.h[5]\n"
+-            "fmla v28.8h, v7.8h, v12.h[5]\n"
+-            "fmla v29.8h, v7.8h, v13.h[5]\n"
+-            "fmla v30.8h, v7.8h, v14.h[5]\n"
+-            "fmla v31.8h, v7.8h, v15.h[5]\n"
+-
+-            "fmla v16.8h, v0.8h, v8.h[6]\n"
+-            "fmla v17.8h, v0.8h, v9.h[6]\n"
+-            "fmla v18.8h, v0.8h, v10.h[6]\n"
+-            "fmla v19.8h, v0.8h, v11.h[6]\n"
+-            "fmla v20.8h, v0.8h, v12.h[6]\n"
+-            "fmla v21.8h, v0.8h, v13.h[6]\n"
+-            "fmla v22.8h, v0.8h, v14.h[6]\n"
+-            "fmla v23.8h, v0.8h, v15.h[6]\n"
+-            "fmla v24.8h, v1.8h, v8.h[6]\n"
+-            "fmla v25.8h, v1.8h, v9.h[6]\n"
+-            "fmla v26.8h, v1.8h, v10.h[6]\n"
+-            "fmla v27.8h, v1.8h, v11.h[6]\n"
+-            "fmla v28.8h, v1.8h, v12.h[6]\n"
+-            "fmla v29.8h, v1.8h, v13.h[6]\n"
+-            "fmla v30.8h, v1.8h, v14.h[6]\n"
+-            "fmla v31.8h, v1.8h, v15.h[6]\n"
+-
+-            "fmla v16.8h, v2.8h, v8.h[7]\n"
+-            "fmla v17.8h, v2.8h, v9.h[7]\n"
+-            "fmla v18.8h, v2.8h, v10.h[7]\n"
+-            "fmla v19.8h, v2.8h, v11.h[7]\n"
+-            "fmla v20.8h, v2.8h, v12.h[7]\n"
+-            "fmla v21.8h, v2.8h, v13.h[7]\n"
+-            "fmla v22.8h, v2.8h, v14.h[7]\n"
+-            "fmla v23.8h, v2.8h, v15.h[7]\n"
+-            "fmla v24.8h, v3.8h, v8.h[7]\n"
+-            "fmla v25.8h, v3.8h, v9.h[7]\n"
+-            "fmla v26.8h, v3.8h, v10.h[7]\n"
+-            "fmla v27.8h, v3.8h, v11.h[7]\n"
+-            "fmla v28.8h, v3.8h, v12.h[7]\n"
+-            "fmla v29.8h, v3.8h, v13.h[7]\n"
+-            "fmla v30.8h, v3.8h, v14.h[7]\n"
+-            "fmla v31.8h, v3.8h, v15.h[7]\n"
+-
+-            // ==== Tail: handle remaining K (if any) ====
++            "lsl x6, x7, #3\n"
++            "add x8, x3, x6\n"
++            "add x9, x4, x6\n"
++            "ldp q8, q10, [x8, #(0 * 16)]\n"
++            "ldr q0, [x10, x7]\n"
++            "ldr q1, [x11, x7]\n"
++            "ldr q2, [x12, x7]\n"
++            "ldr q3, [x13, x7]\n"
++            "fmla v16.8h, v8.8h, v0.h[0]\n"
++            "fmla v17.8h, v8.8h, v1.h[0]\n"
++            "fmla v18.8h, v8.8h, v2.h[0]\n"
++            "fmla v19.8h, v8.8h, v3.h[0]\n"
++            "ldp q9, q11, [x9, #(0 * 16)]\n"
++            "fmla v24.8h, v9.8h, v0.h[0]\n"
++            "fmla v25.8h, v9.8h, v1.h[0]\n"
++            "fmla v26.8h, v9.8h, v2.h[0]\n"
++            "fmla v27.8h, v9.8h, v3.h[0]\n"
++            "ldr q4, [x14, x7]\n"
++            "ldr q5, [x15, x7]\n"
++            "ldr q6, [x16, x7]\n"
++            "ldr q7, [x17, x7]\n"
++            "fmla v20.8h, v8.8h, v4.h[0]\n"
++            "fmla v21.8h, v8.8h, v5.h[0]\n"
++            "fmla v22.8h, v8.8h, v6.h[0]\n"
++            "fmla v23.8h, v8.8h, v7.h[0]\n"
++            "fmla v28.8h, v9.8h, v4.h[0]\n"
++            "fmla v29.8h, v9.8h, v5.h[0]\n"
++            "fmla v30.8h, v9.8h, v6.h[0]\n"
++            "fmla v31.8h, v9.8h, v7.h[0]\n"
++
++#define KERNEL_8x8_M_D_REM(idx, rl1, rl2, rc1, rc2)                    \
++            "ldr q" #rl1 ", [x8, #((" #idx " + 1) * 16)]\n"      \
++            "ldr q" #rl2 ", [x9, #((" #idx " + 1) * 16)]\n"      \
++            /* Interleave low/high M accumulators to spread rename/issue pressure. */ \
++            "fmla v16.8h, v" #rc1 ".8h, v0.h[" #idx "]\n"       \
++            "fmla v24.8h, v" #rc2 ".8h, v0.h[" #idx "]\n"       \
++            "fmla v17.8h, v" #rc1 ".8h, v1.h[" #idx "]\n"       \
++            "fmla v25.8h, v" #rc2 ".8h, v1.h[" #idx "]\n"       \
++            "fmla v18.8h, v" #rc1 ".8h, v2.h[" #idx "]\n"       \
++            "fmla v26.8h, v" #rc2 ".8h, v2.h[" #idx "]\n"       \
++            "fmla v19.8h, v" #rc1 ".8h, v3.h[" #idx "]\n"       \
++            "fmla v27.8h, v" #rc2 ".8h, v3.h[" #idx "]\n"       \
++            "fmla v20.8h, v" #rc1 ".8h, v4.h[" #idx "]\n"       \
++            "fmla v28.8h, v" #rc2 ".8h, v4.h[" #idx "]\n"       \
++            "fmla v21.8h, v" #rc1 ".8h, v5.h[" #idx "]\n"       \
++            "fmla v29.8h, v" #rc2 ".8h, v5.h[" #idx "]\n"       \
++            "fmla v22.8h, v" #rc1 ".8h, v6.h[" #idx "]\n"       \
++            "fmla v30.8h, v" #rc2 ".8h, v6.h[" #idx "]\n"       \
++            "fmla v23.8h, v" #rc1 ".8h, v7.h[" #idx "]\n"       \
++            "fmla v31.8h, v" #rc2 ".8h, v7.h[" #idx "]\n"
++
++            KERNEL_8x8_M_D_REM(1,  8,  9, 10, 11)
++            KERNEL_8x8_M_D_REM(2, 10, 11,  8,  9)
++            KERNEL_8x8_M_D_REM(3,  8,  9, 10, 11)
++            KERNEL_8x8_M_D_REM(4, 10, 11,  8,  9)
++            KERNEL_8x8_M_D_REM(5,  8,  9, 10, 11)
++            KERNEL_8x8_M_D_REM(6, 10, 11,  8,  9)
++#undef KERNEL_8x8_M_D_REM
++
++            "fmla v16.8h, v10.8h, v0.h[7]\n"
++            "fmla v24.8h, v11.8h, v0.h[7]\n"
++            "fmla v17.8h, v10.8h, v1.h[7]\n"
++            "fmla v25.8h, v11.8h, v1.h[7]\n"
++            "fmla v18.8h, v10.8h, v2.h[7]\n"
++            "fmla v26.8h, v11.8h, v2.h[7]\n"
++            "fmla v19.8h, v10.8h, v3.h[7]\n"
++            "fmla v27.8h, v11.8h, v3.h[7]\n"
++            "fmla v20.8h, v10.8h, v4.h[7]\n"
++            "fmla v28.8h, v11.8h, v4.h[7]\n"
++            "fmla v21.8h, v10.8h, v5.h[7]\n"
++            "fmla v29.8h, v11.8h, v5.h[7]\n"
++            "fmla v22.8h, v10.8h, v6.h[7]\n"
++            "fmla v30.8h, v11.8h, v6.h[7]\n"
++            "fmla v23.8h, v10.8h, v7.h[7]\n"
++            "fmla v31.8h, v11.8h, v7.h[7]\n"
++            "add x7, x7, #16\n"
++            "b 7b\n"
++
++            "4:\n"                             // end full-block K loops
++
++            // ==== tail: for (; k2 < K2; k2 += 2), one fp16 at a time ====
+             "5:\n"
+             "cmp x7, %[K2]\n"
+             "b.hs 6f\n"
+ 
+-            // Process 2 bytes (1 fp16) at a time
+-            "lsl x8, x7, #3\n" // k16 = k2 * 8
+-            "ldr h8, [x10, x7]\n"
+-            "ldr h9, [x11, x7]\n"
+-            "ldr h10, [x12, x7]\n"
+-            "ldr h11, [x13, x7]\n"
+-            "ldr h12, [x14, x7]\n"
+-            "ldr h13, [x15, x7]\n"
+-            "ldr h14, [x16, x7]\n"
+-            "ldr h15, [x17, x7]\n"
+-            "ldr q0, [x3, x8]\n"
+-            "ldr q1, [x4, x8]\n"
+-            "fmla v16.8h, v0.8h, v8.h[0]\n"
+-            "fmla v17.8h, v0.8h, v9.h[0]\n"
+-            "fmla v18.8h, v0.8h, v10.h[0]\n"
+-            "fmla v19.8h, v0.8h, v11.h[0]\n"
+-            "fmla v20.8h, v0.8h, v12.h[0]\n"
+-            "fmla v21.8h, v0.8h, v13.h[0]\n"
+-            "fmla v22.8h, v0.8h, v14.h[0]\n"
+-            "fmla v23.8h, v0.8h, v15.h[0]\n"
+-            "fmla v24.8h, v1.8h, v8.h[0]\n"
+-            "fmla v25.8h, v1.8h, v9.h[0]\n"
+-            "fmla v26.8h, v1.8h, v10.h[0]\n"
+-            "fmla v27.8h, v1.8h, v11.h[0]\n"
+-            "fmla v28.8h, v1.8h, v12.h[0]\n"
+-            "fmla v29.8h, v1.8h, v13.h[0]\n"
+-            "fmla v30.8h, v1.8h, v14.h[0]\n"
+-            "fmla v31.8h, v1.8h, v15.h[0]\n"
++            "lsl x8, x7, #3\n"
++            "ldr h0, [x10, x7]\n"
++            "ldr h1, [x11, x7]\n"
++            "ldr h2, [x12, x7]\n"
++            "ldr h3, [x13, x7]\n"
++            "ldr h4, [x14, x7]\n"
++            "ldr h5, [x15, x7]\n"
++            "ldr h6, [x16, x7]\n"
++            "ldr h7, [x17, x7]\n"
++            "ldr q8, [x3, x8]\n"
++            "ldr q9, [x4, x8]\n"
++            "fmla v16.8h, v8.8h, v0.h[0]\n"
++            "fmla v17.8h, v8.8h, v1.h[0]\n"
++            "fmla v18.8h, v8.8h, v2.h[0]\n"
++            "fmla v19.8h, v8.8h, v3.h[0]\n"
++            "fmla v20.8h, v8.8h, v4.h[0]\n"
++            "fmla v21.8h, v8.8h, v5.h[0]\n"
++            "fmla v22.8h, v8.8h, v6.h[0]\n"
++            "fmla v23.8h, v8.8h, v7.h[0]\n"
++            "fmla v24.8h, v9.8h, v0.h[0]\n"
++            "fmla v25.8h, v9.8h, v1.h[0]\n"
++            "fmla v26.8h, v9.8h, v2.h[0]\n"
++            "fmla v27.8h, v9.8h, v3.h[0]\n"
++            "fmla v28.8h, v9.8h, v4.h[0]\n"
++            "fmla v29.8h, v9.8h, v5.h[0]\n"
++            "fmla v30.8h, v9.8h, v6.h[0]\n"
++            "fmla v31.8h, v9.8h, v7.h[0]\n"
++
+             "add x7, x7, #2\n"
+             "b 5b\n"
+ 
+-            "6:\n" // end of K loop
+-
+-            // Advance pa to next M block
+-            "lsl x6, %[a_stride_bytes], #4\n add x3, x3, x6\n"
+-
+-            // ==== Convert accumulators from fp16 to fp32 and store ====
+-            // We have 8 rows × 2 row groups = 16 rows total
+-            // Accumulators: v16..v23 = row group 0 (rows 0-7), v24..v31 = row group 1 (rows 8-15)
+-            // Each accumulator has 8 fp16 partial sums that need horizontal sum via fcvt + addv
+-
+-            // Convert and store row by row
+-            // For each accumulator (8 fp16 values):
+-            //   1. Convert to 2x fp32 vectors (fcvtl low, fcvtl2 high)
+-            //   2. Sum each to scalar (addv)
+-            //   3. Store the result
+-
+-            "lsl x5, x2, #2\n add x5, x5, %[C]\n"
+-
+-            // Each accumulator has 8 separate fp16 dot products (8 different A rows)
+-            // Convert to fp32 and store as 8 separate output values
+-            // acc v16 = rows 0-7 of group 0, acc v24 = rows 0-7 of group 1 (rows 8-15 total)
+-#define STORE_ROW_GROUP(acc_lo, acc_hi, off)                           \
+-            "fcvtl v0.4s, " #acc_lo ".4h\n"                            \
+-            "fcvtl2 v1.4s, " #acc_lo ".8h\n"                           \
+-            "fcvtl v2.4s, " #acc_hi ".4h\n"                            \
+-            "fcvtl2 v3.4s, " #acc_hi ".8h\n"                           \
+-            "stp q0, q1, [x5, #(0 + " #off ")]\n"                      \
+-            "stp q2, q3, [x5, #(32 + " #off ")]\n"
+-
+-            STORE_ROW_GROUP(v16, v24, 0)
+-            "add x5, x5, %[c_stride_bytes]\n"
+-            STORE_ROW_GROUP(v17, v25, 0)
+-            "add x5, x5, %[c_stride_bytes]\n"
+-            STORE_ROW_GROUP(v18, v26, 0)
+-            "add x5, x5, %[c_stride_bytes]\n"
+-            STORE_ROW_GROUP(v19, v27, 0)
+-            "add x5, x5, %[c_stride_bytes]\n"
+-            STORE_ROW_GROUP(v20, v28, 0)
+-            "add x5, x5, %[c_stride_bytes]\n"
+-            STORE_ROW_GROUP(v21, v29, 0)
+-            "add x5, x5, %[c_stride_bytes]\n"
+-            STORE_ROW_GROUP(v22, v30, 0)
+-            "add x5, x5, %[c_stride_bytes]\n"
+-            STORE_ROW_GROUP(v23, v31, 0)
+-
+-#undef STORE_ROW_GROUP
++            "6:\n"                             // end K loop
++
++            "add x3, x3, %[a_stride_lsl4]\n"   // pa0 += 16 * a_stride_bytes
++
++            "lsl x5, x2, #2\n"
++            "add x5, x5, %[C]\n"               // ptrC = C + j
++
++            "fcvtl v0.4s, v16.4h\n  fcvtl2 v1.4s, v16.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v24.4h\n  fcvtl2 v1.4s, v24.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v17.4h\n  fcvtl2 v1.4s, v17.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v25.4h\n  fcvtl2 v1.4s, v25.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v18.4h\n  fcvtl2 v1.4s, v18.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v26.4h\n  fcvtl2 v1.4s, v26.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v19.4h\n  fcvtl2 v1.4s, v19.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v27.4h\n  fcvtl2 v1.4s, v27.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v20.4h\n  fcvtl2 v1.4s, v20.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v28.4h\n  fcvtl2 v1.4s, v28.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v21.4h\n  fcvtl2 v1.4s, v21.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v29.4h\n  fcvtl2 v1.4s, v29.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v22.4h\n  fcvtl2 v1.4s, v22.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v30.4h\n  fcvtl2 v1.4s, v30.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v23.4h\n  fcvtl2 v1.4s, v23.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v31.4h\n  fcvtl2 v1.4s, v31.8h\n  stp q0, q1, [x5, #32]\n"
+ 
+             "add x2, x2, #16\n"
+             "cmp x2, %[M]\n"
+-            "b.cc 2b\n" // endfor j
++            "b.cc 2b\n"
+ 
+-            // Advance C and B to next N block
+-            "lsl x6, %[c_stride_bytes], #3\n add %[C], %[C], x6\n" // C += 8 * c_stride
+-            "lsl x6, %[b_stride_bytes], #3\n add x10, x10, x6\n" // pb0 += 8 * b_stride
++            "add %[C], %[C], %[c_stride_lsl3]\n" // C += 8 * c_stride_bytes
++            "add x10, x10, %[b_stride_lsl3]\n"  // pb0 += 8 * b_stride_bytes
+ 
+             "add x1, x1, #8\n"
+             "cmp x1, %[N]\n"
+-            "b.cc 1b\n" // endfor i
++            "b.cc 1b\n"
+         : [C] "+r"(C)
+         : [N] "r"(N),
+           [M] "r"(M),
+-          [K2] "r"((long)(K * 2)),
++          [K2] "r"(K * 2),
+           [B] "r"(B),
+           [pa] "r"(pack_a->p),
+-          [a_stride_bytes] "r"(a_stride_bytes),
+-          [a_stride_bytes_lsl3] "r"(a_stride_bytes * 8),
+-          [b_stride_bytes] "r"(b_stride_bytes),
+-          [c_stride_bytes] "r"(c_stride_bytes)
+-        : "memory",
++          [a_stride_lsl3] "r"(a_stride_bytes * 8),
++          [a_stride_lsl4] "r"(a_stride_bytes * 16),
++          [b_stride] "r"(b_stride_bytes),
++          [b_stride_lsl3] "r"(b_stride_bytes * 8),
++          [c_stride] "r"(c_stride_bytes),
++          [c_stride_lsl3] "r"(c_stride_bytes * 8)
++        : "memory", "cc",
+           "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
+-          "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
++          "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18",
+           "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+-          "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
++          "v8", "v9", "v10", "v11",
+           "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+           "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31"
+     );
+ }
+-
+ void matmul_outer_packA_destroy(matmul_outer_pack_t *spack) {
+     if (!spack) {
+         return;
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 111153f8..a1936e60 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -98,6 +98,16 @@ matmul_outer_8x16_b_micro_packA_f16(size_t M,
+                                     size_t b_column_bytes,
+                                     void* GGML_RESTRICT c,
+                                     size_t c_column_bytes);
++void
++matmul_outer_4x16_b_micro_packA_f16(size_t M,
++                                    size_t N,
++                                    size_t K,
++                                    const void* a,
++                                    size_t a_column_bytes,
++                                    const void* b,
++                                    size_t b_column_bytes,
++                                    void* GGML_RESTRICT c,
++                                    size_t c_column_bytes);
+ 
+ void
+ matmul_outer_8x16_b_micro_packA_f16_neon(size_t M,
+@@ -473,6 +483,13 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
+             ay1 = svmul_f32_m(pg, ay1, vx);
+             svst1_f32(pg, y + np, ay1);
+         }
++        // leftover count can be up to 2*ggml_f32_epr - 1; loop in ggml_f32_epr chunks
++        // for (int i = np; i < n; i += ggml_f32_epr) {
++        //     svbool_t pg = svwhilelt_b32(i, n);
++        //     ay1 = svld1_f32(pg, y + i);
++        //     ay1 = svmul_f32_m(pg, ay1, vx);
++        //     svst1_f32(pg, y + i, ay1);
++        // }
+     #else
+         const int np = (n & ~(GGML_F32_STEP - 1));
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4ab57438..5f61cd52 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include <cinttypes>
+ #include <cstring>
++#include <cmath>
++#include <cstdlib>
+ #include <limits>
+ #include <stdexcept>
+ 
+@@ -687,6 +689,144 @@ llm_graph_result_ptr llama_context::process_ubatch(const llama_ubatch & ubatch,
+         return nullptr;
+     }
+ 
++    // Tensor dump for precision debugging
++    // Set LLAMA_DUMP_DIR to a writable directory like /tmp/dump_baseline or /tmp/dump_f16opt
++    // to dump all F32 intermediate tensor stats after graph compute.
++    // {
++    //     const char* dump_dir = getenv("LLAMA_DUMP_DIR");
++    //     if (dump_dir) {
++    //         const int n_nodes = ggml_graph_n_nodes(gf);
++
++    //         char path_buf[1024];
++    //         snprintf(path_buf, sizeof(path_buf), "mkdir -p %s", dump_dir);
++    //         system(path_buf);
++
++    //         static int64_t dump_call_count = 0;
++    //         dump_call_count++;
++
++    //         char call_dir[1024];
++    //         snprintf(call_dir, sizeof(call_dir), "%s/call_%04" PRId64, dump_dir, dump_call_count);
++    //         snprintf(path_buf, sizeof(path_buf), "mkdir -p %s", call_dir);
++    //         system(path_buf);
++
++    //         // Write metadata
++    //         snprintf(path_buf, sizeof(path_buf), "%s/meta.txt", call_dir);
++    //         FILE* meta = fopen(path_buf, "w");
++    //         if (meta) {
++    //             fprintf(meta, "n_nodes=%d n_tokens=%d\n", n_nodes, ubatch.n_tokens);
++    //             fclose(meta);
++    //         }
++
++    //         // Dump each node's stats
++    //         for (int i = 0; i < n_nodes; i++) {
++    //             struct ggml_tensor* t = ggml_graph_node(gf, i);
++    //             if (!t || !t->data) continue;
++
++    //             // Only dump F32 tensors that are results of operations
++    //             // (skip inputs/parameters/views)
++    //             if (t->type != GGML_TYPE_F32) continue;
++    //             if (t->op == GGML_OP_NONE) continue;
++    //             if (t->op == GGML_OP_VIEW) continue;
++    //             if (t->op == GGML_OP_RESHAPE) continue;
++    //             if (t->op == GGML_OP_PERMUTE) continue;
++    //             if (t->op == GGML_OP_TRANSPOSE) continue;
++    //             if (t->op == GGML_OP_CPY) continue;
++    //             if (t->op == GGML_OP_CONT) continue;
++
++    //             const char* name = ggml_get_name(t);
++    //             const char* op_name = ggml_op_name(t->op);
++    //             int64_t ne0 = t->ne[0];
++    //             int64_t ne1 = t->ne[1];
++    //             int64_t ne2 = t->ne[2];
++    //             int64_t ne3 = t->ne[3];
++
++    //             // Compute stats
++    //             float min_val = 0.0f, max_val = 0.0f;
++    //             double sum = 0.0, sum2 = 0.0;
++    //             int64_t n_elems = ggml_nelements(t);
++
++    //             if (n_elems > 0) {
++    //                 const float* data = (const float*)t->data;
++    //                 min_val = max_val = data[0];
++    //                 for (int64_t j = 0; j < n_elems && j < 100000; j++) {
++    //                     float v = data[j];
++    //                     if (v < min_val) min_val = v;
++    //                     if (v > max_val) max_val = v;
++    //                     sum += v;
++    //                     sum2 += (double)v * v;
++    //                 }
++    //                 // If more than 100k elements, subsample
++    //                 if (n_elems > 100000) {
++    //                     for (int64_t j = 100000; j < n_elems; j += 100) {
++    //                         float v = data[j];
++    //                         if (v < min_val) min_val = v;
++    //                         if (v > max_val) max_val = v;
++    //                         sum += v;
++    //                         sum2 += (double)v * v;
++    //                     }
++    //                     sum  = sum  * n_elems / (100000 + (n_elems - 100000 + 99) / 100);
++    //                     sum2 = sum2 * n_elems / (100000 + (n_elems - 100000 + 99) / 100);
++    //                 }
++    //             }
++
++    //             double norm = sqrt(sum2);
++
++    //             // Compute checksum (simple XOR of float bits)
++    //             uint32_t checksum = 0;
++    //             if (n_elems > 0 && n_elems <= 100000) {
++    //                 const float* data = (const float*)t->data;
++    //                 for (int64_t j = 0; j < n_elems; j++) {
++    //                     uint32_t bits;
++    //                     memcpy(&bits, &data[j], sizeof(bits));
++    //                     checksum ^= bits;
++    //                 }
++    //             }
++
++    //             // First 5 and last 5 elements
++    //             float first5[5] = {0};
++    //             float last5[5] = {0};
++    //             if (n_elems > 0) {
++    //                 const float* data = (const float*)t->data;
++    //                 int n_first = n_elems < 5 ? n_elems : 5;
++    //                 int n_last  = n_elems < 5 ? 0 : (n_elems < 10 ? n_elems - 5 : 5);
++    //                 for (int j = 0; j < n_first; j++) first5[j] = data[j];
++    //                 for (int j = 0; j < n_last;  j++) last5[j] = data[n_elems - n_last + j];
++    //             }
++
++    //             // Write tensor stats as single CSV line
++    //             char csv_path[1024];
++    //             snprintf(csv_path, sizeof(csv_path), "%s/tensors.csv", call_dir);
++    //             FILE* csv = fopen(csv_path, "a");
++    //             if (csv) {
++    //                 fprintf(csv, "%d,%s,%s,%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ","
++    //                         "%.10e,%.10e,%.10e,%.10e,%.10e,%08x,"
++    //                         "%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e\n",
++    //                         i, name ? name : "", op_name ? op_name : "",
++    //                         ne0, ne1, ne2, ne3,
++    //                         (double)(n_elems > 0 ? sum/n_elems : 0), norm,
++    //                         (double)min_val, (double)max_val,
++    //                         (double)(n_elems > 0 ? sum2/n_elems : 0),
++    //                         (unsigned)checksum,
++    //                         (double)first5[0], (double)first5[1], (double)first5[2],
++    //                         (double)first5[3], (double)first5[4],
++    //                         (double)(n_elems > 0 ? last5[0] : 0),
++    //                         (double)(n_elems > 0 ? last5[1] : 0),
++    //                         (double)(n_elems > 0 ? last5[2] : 0),
++    //                         (double)(n_elems > 0 ? last5[3] : 0),
++    //                         (double)(n_elems > 0 ? last5[4] : 0));
++    //                 fclose(csv);
++    //             }
++    //         }
++
++    //         // Also dump the full graph as a DOT file for visualization
++    //         char dot_path[1024];
++    //         snprintf(dot_path, sizeof(dot_path), "%s/graph.dot", call_dir);
++    //         ggml_graph_dump_dot(gf, NULL, dot_path);
++
++    //         LLAMA_LOG_INFO("%s: dumped %d tensors to %s\n", __func__, n_nodes, call_dir);
++    //     }
++    // }
++
+     ret = GGML_STATUS_SUCCESS;
+ 
+     return res;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 28f744e3..7eea1789 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1117,6 +1117,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+          q->ne[2] % kq_mask->ne[2] == 0 &&
+          q->ne[3] % kq_mask->ne[3] == 0);
+ 
++    // FIXME: fused SDPA tail path has numerical accuracy issues when the
++    // last Q tile's row count (Lc_eff % 8) is 6 or 7, corresponding to
++    // n_tokens % 16 being 14 or 15 after BERT's [CLS]+[SEP] token overhead.
++    // Fall back to the standard matmul path for these sequences.
++    const int64_t n_tok_mod = n_tokens % 16;
++    const bool fused_sdpa_problematic_len = (n_tok_mod >= 10);
++
+     const bool use_fused_cpp_attn =
+         build_attn_mha_use_fused_sdpa() &&
+         backend_cpu != nullptr &&
+@@ -1134,7 +1141,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         q->ne[3] == v->ne[3] &&
+         q->nb[0] == ggml_type_size(q->type) &&
+         (v->ne[0] % 8) == 0 &&
+-        fused_sdpa_mask_supported;
++        fused_sdpa_mask_supported &&
++        !fused_sdpa_problematic_len;
+ 
+     ggml_tensor * cur;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index afef8487..01c42088 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -5906,6 +5906,7 @@ struct llm_build_bert : public llm_graph_context {
+         // embed layer norm
+         inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, -1);
+         cb(inpL, "inp_norm", -1);
++        ggml_set_name(inpL, "L0_inp_norm");
+ 
+         auto * inp_attn = build_attn_inp_no_cache();
+ 
+@@ -5977,6 +5978,7 @@ struct llm_build_bert : public llm_graph_context {
+                     model.layers[il].wo, model.layers[il].bo,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+             cb(cur, "kqv_out", il);
++            { char n[64]; snprintf(n,64,"L%d_attn_out",il); ggml_set_name(cur, n); }
+ 
+             if (il == n_layer - 1 && pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                 // skip computing output for unused tokens
+@@ -5990,6 +5992,7 @@ struct llm_build_bert : public llm_graph_context {
+ 
+             // attention layer norm
+             cur = build_norm(cur, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, il);
++            { char n[64]; snprintf(n,64,"L%d_attn_norm",il); ggml_set_name(cur, n); }
+ 
+             if (model.layers[il].attn_norm_2 != nullptr) {
+                 cur = ggml_add(ctx0, cur, inpL); // re-add the layer input
+@@ -6040,12 +6043,14 @@ struct llm_build_bert : public llm_graph_context {
+                         LLM_FFN_SILU, LLM_FFN_PAR, il);
+                 cb(cur, "ffn_out", il);
+             }
++            { char n[64]; snprintf(n,64,"L%d_ffn_out",il); ggml_set_name(cur, n); }
+ 
+             // attentions bypass the intermediate layer
+             cur = ggml_add(ctx0, cur, ffn_inp);
+ 
+             // output layer norm
+             cur = build_norm(cur, model.layers[il].layer_out_norm, model.layers[il].layer_out_norm_b, LLM_NORM, il);
++            { char n[64]; snprintf(n,64,"L%d_out_norm",il); ggml_set_name(cur, n); }
+ 
+             // input for next layer
+             inpL = cur;
+@@ -6054,6 +6059,7 @@ struct llm_build_bert : public llm_graph_context {
+         cur = inpL;
+ 
+         cb(cur, "result_embd", -1);
++        ggml_set_name(cur, "result_embd");
+         res->t_embd = cur;
+ 
+         ggml_build_forward_expand(gf, cur);
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 9038df4c..df93f898 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -2571,7 +2571,7 @@ struct server_context {
+             if (llama_pooling_type(slot.ctx) != LLAMA_POOLING_TYPE_NONE) {
+                 common_embd_normalize(embd, embd_res.data(), n_embd, 2);
+                 res->embedding.push_back(embd_res);
+-            } else {
++            } else {  
+                 res->embedding.push_back({ embd, embd + n_embd });
+             }
+         }
+diff --git a/tools/server/utils.hpp b/tools/server/utils.hpp
+index f3e0392a..6e40a33e 100644
+--- a/tools/server/utils.hpp
++++ b/tools/server/utils.hpp
+@@ -1187,6 +1187,10 @@ public:
+         tokens.clear();
+     }
+ 
++    void reserve(size_t n) {
++        tokens.reserve(n);
++    }
++
+     void keep_first(size_t n) {
+         GGML_ASSERT(n <= tokens.size());
+         if (has_mtmd) {
