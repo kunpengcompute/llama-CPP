@@ -27,42 +27,59 @@ taskset -c $(seq -s, 128 2 158) env OMP_NUM_THREADS=16 ./build/bin/llama-server 
 ```shell
 taskset -c $(seq -s, 128 2 158) env OMP_NUM_THREADS=16 ./build/bin/llama-bench -m /path/to/bge-m3-FP16.gguf -p 256 -b 256 -n 0 -t 16 -r 50
 ```
-920B性能：
-```shell
-| model                          |       size |     params | backend    | threads | n_batch |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | ------: | --------------: | -------------------: |
-| bert 335M F16                  |   1.07 GiB |   566.70 M | CPU        |      16 |     256 |           pp256 |       1641.90 ± 6.83 |
 
-build: 5a4c21944 (5590)
 
+- 文件改动
 ```
-
-
-2. 端到端向llama-server发送embedding请求
-```shell
-python bge_embedding_server_test.py 1,2,4,8,16
-```
-
-920B性能：
-```shell
-Test Results: Total Requests: 1, Successful Requests: 1, Failed Requests: 0, Total Time: 0.15 seconds, Throughput: 6.88 requests/second, Average Latency: 144.54 ms
-
-Test Results: Total Requests: 2, Successful Requests: 2, Failed Requests: 0, Total Time: 0.27 seconds, Throughput: 7.53 requests/second, Average Latency: 199.50 ms
-
-Test Results: Total Requests: 4, Successful Requests: 4, Failed Requests: 0, Total Time: 0.53 seconds, Throughput: 7.49 requests/second, Average Latency: 333.85 ms
-
-Test Results: Total Requests: 8, Successful Requests: 8, Failed Requests: 0, Total Time: 1.08 seconds, Throughput: 7.43 requests/second, Average Latency: 606.34 ms
-
-Test Results: Total Requests: 16, Successful Requests: 16, Failed Requests: 0, Total Time: 2.14 seconds, Throughput: 7.46 requests/second, Average Latency: 1135.86 ms
-
-Test Results: Total Requests: 1, Total Time: 0.15 seconds, Throughput: 6.88 requests/second, Average Latency: 144.54 ms
-
-Test Results: Total Requests: 2, Total Time: 0.27 seconds, Throughput: 7.53 requests/second, Average Latency: 199.50 ms
-
-Test Results: Total Requests: 4, Total Time: 0.53 seconds, Throughput: 7.49 requests/second, Average Latency: 333.85 ms
-
-Test Results: Total Requests: 8, Total Time: 1.08 seconds, Throughput: 7.43 requests/second, Average Latency: 606.34 ms
-
-Test Results: Total Requests: 16, Total Time: 2.14 seconds, Throughput: 7.46 requests/second, Average Latency: 1135.86 ms
-Excel 文件已生成：test_results.xlsx
+  |-- common/
+  |   |-- CMakeLists.txt  [mod]
+  |   `-- common.cpp  [mod]
+  |-- compile.sh  [+new]
+  |-- ggml/
+  |   |-- include/
+  |   |   |-- ggml-cpu.h  [mod]
+  |   |   `-- ggml.h  [mod]
+  |   `-- src/
+  |       |-- ggml.c  [mod]
+  |       `-- ggml-cpu/
+  |           |-- CMakeLists.txt  [mod]
+  |           |-- ggml-cpu.c  [mod]
+  |           |-- ggml-cpu-quants.c  [mod]
+  |           |-- ggml-cpu-quants.h  [mod]
+  |           |-- ops.cpp  [mod]
+  |           |-- ops.h  [mod]
+  |           |-- vec.cpp  [mod]
+  |           |-- vec.h  [mod]
+  |           `-- fused-cpp/
+  |               `-- fp32_packqkv/
+  |                   |-- fp32_packqkv_sdpa.cpp  [+new]
+  |                   |-- fp32_packqkv_sdpa.h  [+new]
+  |                   |-- parse_embedding_perf_log.py  [+new]
+  |                   `-- csrc/
+  |                       |-- sdpa_common.h  [+new]
+  |                       |-- sdpa_flash2_neon_l3kv_impl.h  [+new]
+  |                       |-- sdpa_pack_utils.h  [+new]
+  |                       |-- sdpa_profile.h  [+new]
+  |                       |-- sdpa_standalone_shim.h  [+new]
+  |                       |-- sdpa_tile_sizes.h  [+new]
+  |                       `-- sdpa_microkernels/
+  |                           |-- mk_traits.h  [+new]
+  |                           |-- neon_cache_config.h  [+new]
+  |                           |-- neon_cache_microkernels.h  [+new]
+  |                           `-- impls/
+  |                               `-- mk_qk_packqk_seq4_bmajor_pv_pquad.h  [+new]
+  |-- pocs/
+  |   `-- vdot/
+  |       |-- CMakeLists.txt  [mod]
+  |       `-- test_q8_0_matmul.cpp  [+new]
+  |-- src/
+  |   |-- llama-context.cpp  [mod]
+  |   |-- llama-graph.cpp  [mod]
+  |   |-- llama-graph.h  [mod]
+  |   `-- llama-model.cpp  [mod]
+  |-- test_correctness.py  [+new]
+  `-- tools/
+      `-- server/
+          |-- server.cpp  [mod]
+          `-- utils.hpp  [mod]
 ```
