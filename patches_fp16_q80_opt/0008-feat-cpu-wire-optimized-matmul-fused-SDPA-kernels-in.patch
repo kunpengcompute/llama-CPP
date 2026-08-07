@@ -1,0 +1,578 @@
+From bc3e6922b6b9e3216e660020c145790ed832f66b Mon Sep 17 00:00:00 2001
+From: Kaixin Liu <liukaixin1@h-partners.com>
+Date: Thu, 6 Aug 2026 16:20:06 +0800
+Subject: [PATCH 07/10] feat(llama): add GGML fused SDPA op and integrate into
+ graph
+
+- ggml.h / ggml.c: new GGML_OP_FUSED_CPP_SDPA_EXT op + ggml_fused_cpp_sdpa_ext()
+  (F32 q/k/v optional F16/F32 mask, MHA only)
+- ops.h/ops.cpp: ggml_compute_forward_fused_cpp_sdpa_ext with head-level
+  thread partitioning and 64x64 diagonal-block path for L==S
+- ggml-cpu/CMakeLists.txt: ARM build wires fused-cpp sources under
+  GGML_USE_FUSED_CPP_SDPA
+- llama-graph.cpp/h: build_attn_mha picks the fused SDPA path on aarch64
+  (env GGML_FUSED_CPP_SDPA can disable/debug)
+---
+ ggml/include/ggml.h              |  11 ++
+ ggml/src/ggml-cpu/CMakeLists.txt |  14 ++
+ ggml/src/ggml-cpu/ops.cpp        | 241 ++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cpu/ops.h          |   1 +
+ ggml/src/ggml.c                  |  45 +++++-
+ src/llama-graph.cpp              |  88 ++++++++++-
+ src/llama-graph.h                |   4 +
+ 7 files changed, 400 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 1a57f1cd..02bf7fc9 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -495,6 +495,7 @@ extern "C" {
+         GGML_OP_LEAKY_RELU,
+ 
+         GGML_OP_FLASH_ATTN_EXT,
++        GGML_OP_FUSED_CPP_SDPA_EXT,
+         GGML_OP_FLASH_ATTN_BACK,
+         GGML_OP_SSM_CONV,
+         GGML_OP_SSM_SCAN,
+@@ -1857,6 +1858,16 @@ extern "C" {
+     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
+             const struct ggml_tensor * a);
+ 
++    // fused_cpp embedding SDPA path:
++    // q/k/v/out are F32, MHA only (n_head == n_head_kv), mask is optional F16/F32.
++    GGML_API struct ggml_tensor * ggml_fused_cpp_sdpa_ext(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * mask,
++            float                 scale);
++
+     // TODO: needs to be adapted to ggml_flash_attn_ext
+     GGML_API struct ggml_tensor * ggml_flash_attn_back(
+            struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index 33f66af8..19e4f27a 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -84,6 +84,18 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+ 
+     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
+         message(STATUS "ARM detected")
++        set(GGML_FUSED_CPP_FP32_PACKQKV_DIR ggml-cpu/fused-cpp/fp32_packqkv)
++        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
++            set_source_files_properties(${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/fp32_packqkv_sdpa.cpp PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden")
++        endif()
++        list(APPEND GGML_CPU_SOURCES
++            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/fp32_packqkv_sdpa.cpp
++            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/fp32_packqkv_sdpa.h
++            )
++        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FUSED_CPP_SDPA GGML_FUSED_CPP_BUILTIN)
++        target_include_directories(${GGML_CPU_NAME} PRIVATE
++            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}
++            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/csrc)
+         if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+             message(FATAL_ERROR "MSVC is not supported for ARM, use clang")
+         else()
+@@ -493,3 +505,5 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         set_target_properties(${GGML_CPU_NAME} PROPERTIES COMPILE_FLAGS "-msimd128")
+     endif()
+ endfunction()
++
++set(ARCH_FLAGS "-mcpu=hip09+crypto+fp16+rcpc+sha3+sm4+bf16+nodotprod+noprofile+nopredres+nof32mm+nof64mm+dotprod+noi8mm+sve")
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index d8de7531..f682c3a3 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -6,7 +6,28 @@
+ #include "unary-ops.h"
+ #include "vec.h"
+ 
+-#include <float.h>
++#if defined(GGML_USE_FUSED_CPP_SDPA)
++#include "fused-cpp/fp32_packqkv/fp32_packqkv_sdpa.h"
++#endif
++
++#include <algorithm>
++#include <cfloat>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#if defined(GGML_USE_FUSED_CPP_SDPA)
++static bool ggml_fused_cpp_sdpa_env_is(const char * value) {
++    const char * env = std::getenv("GGML_FUSED_CPP_SDPA");
++    return env != nullptr && strcmp(env, value) == 0;
++}
++
++static bool ggml_fused_cpp_sdpa_debug() {
++    return ggml_fused_cpp_sdpa_env_is("debug") ||
++           ggml_fused_cpp_sdpa_env_is("trace");
++}
++#endif
+ 
+ // ggml_compute_forward_dup
+ 
+@@ -7185,6 +7206,224 @@ void ggml_compute_forward_flash_attn_ext(
+     }
+ }
+ 
++static void ggml_compute_forward_fused_cpp_sdpa_ext_impl(
++        const float * q,
++        const float * k,
++        const float * v,
++        const float * mask_f32,
++        const uint16_t * mask_f16,
++              float * dst,
++        int64_t B, int64_t H, int64_t L, int64_t S, int64_t D, int64_t DV,
++        int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
++        int64_t k_nb0, int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
++        int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
++        int64_t o_nb0, int64_t o_nb1, int64_t o_nb2, int64_t o_nb3,
++        int64_t m_ne0, int64_t m_ne1, int64_t m_ne2, int64_t m_ne3,
++        int64_t m_nb0, int64_t m_nb1, int64_t m_nb2, int64_t m_nb3,
++        float scale) {
++    int ret = 0;
++    if (mask_f16 != nullptr) {
++        ret = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
++                q, k, v, mask_f16, dst,
++                B, H, L, S, D, DV,
++                q_nb0, q_nb1, q_nb2, q_nb3,
++                k_nb0, k_nb1, k_nb2, k_nb3,
++                v_nb0, v_nb1, v_nb2, v_nb3,
++                o_nb0, o_nb1, o_nb2, o_nb3,
++                m_ne0, m_ne1, m_ne2, m_ne3,
++                m_nb0, m_nb1, m_nb2, m_nb3,
++                scale);
++    } else if (mask_f32 != nullptr) {
++        ret = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
++                q, k, v, mask_f32, dst,
++                B, H, L, S, D, DV,
++                q_nb0, q_nb1, q_nb2, q_nb3,
++                k_nb0, k_nb1, k_nb2, k_nb3,
++                v_nb0, v_nb1, v_nb2, v_nb3,
++                o_nb0, o_nb1, o_nb2, o_nb3,
++                m_ne0, m_ne1, m_ne2, m_ne3,
++                m_nb0, m_nb1, m_nb2, m_nb3,
++                scale);
++    } else {
++        ret = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
++                q, k, v, dst,
++                B, H, L, S, D, DV,
++                q_nb0, q_nb1, q_nb2, q_nb3,
++                k_nb0, k_nb1, k_nb2, k_nb3,
++                v_nb0, v_nb1, v_nb2, v_nb3,
++                o_nb0, o_nb1, o_nb2, o_nb3,
++                scale);
++    }
++    if (ret != 0) {
++        GGML_ABORT("fused_cpp fp32_packqkv sdpa failed with code %d", ret);
++    }
++}
++
++void ggml_compute_forward_fused_cpp_sdpa_ext(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++#if defined(GGML_USE_FUSED_CPP_SDPA)
++    GGML_ASSERT(dst->op == GGML_OP_FUSED_CPP_SDPA_EXT);
++
++    const ggml_tensor * q    = dst->src[0];
++    const ggml_tensor * k    = dst->src[1];
++    const ggml_tensor * v    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++
++    GGML_ASSERT(q->type == GGML_TYPE_F32);
++    GGML_ASSERT(k->type == GGML_TYPE_F32);
++    GGML_ASSERT(v->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(q->ne[0] == k->ne[0]);
++    GGML_ASSERT(k->ne[1] == v->ne[1]);
++    GGML_ASSERT(q->ne[2] == k->ne[2]);
++    GGML_ASSERT(q->ne[2] == v->ne[2]);
++    GGML_ASSERT(q->ne[3] == k->ne[3]);
++    GGML_ASSERT(q->ne[3] == v->ne[3]);
++    GGML_ASSERT(dst->ne[0] == v->ne[0]);
++    GGML_ASSERT(dst->ne[1] == q->ne[2]);
++    GGML_ASSERT(dst->ne[2] == q->ne[1]);
++    GGML_ASSERT(dst->ne[3] == q->ne[3]);
++    GGML_ASSERT(q->nb[0] == ggml_type_size(q->type));
++    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
++
++    float scale;
++    memcpy(&scale, dst->op_params, sizeof(scale));
++
++    const int64_t B  = q->ne[3];
++    const int64_t H  = q->ne[2];
++    const int64_t L  = q->ne[1];
++    const int64_t S  = k->ne[1];
++    const int64_t D  = q->ne[0];
++    const int64_t DV = v->ne[0];
++
++    GGML_ASSERT((DV % 8) == 0);
++
++    const int n_task = params->nth;
++    const int ith    = params->ith;
++
++    // partition heads across threads
++    const int64_t h_per_task = (H + n_task - 1) / n_task;
++    const int64_t h_start    = ith * h_per_task;
++    const int64_t h_end      = MIN(h_start + h_per_task, H);
++
++    if (h_start >= h_end) {
++        return;
++    }
++
++    if (ggml_fused_cpp_sdpa_debug()) {
++        fprintf(stderr, "%s: executing fused_cpp SDPA: B=%lld H=%lld[%lld..%lld) L=%lld S=%lld D=%lld DV=%lld mask=%s ith=%d/%d\n",
++                __func__,
++                (long long) B, (long long) h_start, (long long) h_end,
++                (long long) L, (long long) S, (long long) D, (long long) DV,
++                mask == nullptr ? "none" : ggml_type_name(mask->type),
++                ith, n_task);
++    }
++
++    // offset data pointers to the start of this thread's head range
++    // q/k/v after permute(0,2,1,3) have shape [D, n_tokens, n_head, B];
++    //   nb[2] is the stride for the n_head dimension (= D*4)
++    // dst has shape [D, n_head, n_tokens, B];
++    //   nb[1] is the stride for the n_head dimension (= D*4)
++    const float * q_h = (const float *) q->data + h_start * (q->nb[2] / sizeof(float));
++    const float * k_h = (const float *) k->data + h_start * (k->nb[2] / sizeof(float));
++    const float * v_h = (const float *) v->data + h_start * (v->nb[2] / sizeof(float));
++          float * o_h = (      float *) dst->data + h_start * (dst->nb[1] / sizeof(float));
++
++    const int64_t H_th = h_end - h_start;
++
++    const uint16_t * mask_f16 = (mask != nullptr && mask->type == GGML_TYPE_F16) ? (const uint16_t *) mask->data : nullptr;
++    const float    * mask_f32 = (mask != nullptr && mask->type == GGML_TYPE_F32) ? (const float    *) mask->data : nullptr;
++
++    const int64_t BLK = 64;
++
++    /*
++    * 对角块 SDPA:
++    * 适用于 L == S 的 prompt processing 场景。
++    *
++    * 原始:
++    *   L x S
++    *
++    * 改后:
++    *   多个 64 x 64 对角块
++    *
++    * 注意：这不是严格等价优化，正确性后面需要验证。
++    */
++    if (L == S && L > BLK && (L % BLK) == 0) {
++        for (int64_t l0 = 0; l0 < L; l0 += BLK) {
++            const int64_t L_cur = BLK;
++            const int64_t S_cur = BLK;
++
++            const float * q_blk =
++                q_h + l0 * (q->nb[1] / sizeof(float));
++
++            const float * k_blk =
++                k_h + l0 * (k->nb[1] / sizeof(float));
++
++            const float * v_blk =
++                v_h + l0 * (v->nb[1] / sizeof(float));
++
++            float * o_blk =
++                o_h + l0 * (dst->nb[2] / sizeof(float));
++
++            const float * mask_f32_blk =
++                mask_f32 ?
++                mask_f32
++                    + l0 * (mask->nb[1] / sizeof(float))
++                    + l0 * (mask->nb[0] / sizeof(float))
++                : nullptr;
++
++            const uint16_t * mask_f16_blk =
++                mask_f16 ?
++                mask_f16
++                    + l0 * (mask->nb[1] / sizeof(uint16_t))
++                    + l0 * (mask->nb[0] / sizeof(uint16_t))
++                : nullptr;
++
++            ggml_compute_forward_fused_cpp_sdpa_ext_impl(
++                    q_blk, k_blk, v_blk, mask_f32_blk, mask_f16_blk, o_blk,
++                    B, H_th, L_cur, S_cur, D, DV,
++                    (int64_t) q->nb[0],   (int64_t) q->nb[1],   (int64_t) q->nb[2],   (int64_t) q->nb[3],
++                    (int64_t) k->nb[0],   (int64_t) k->nb[1],   (int64_t) k->nb[2],   (int64_t) k->nb[3],
++                    (int64_t) v->nb[0],   (int64_t) v->nb[1],   (int64_t) v->nb[2],   (int64_t) v->nb[3],
++                    (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
++
++                    mask ? S_cur       : 0,
++                    mask ? L_cur       : 0,
++                    mask ? mask->ne[2] : 0,
++                    mask ? mask->ne[3] : 0,
++                    mask ? mask->nb[0] : 0,
++                    mask ? mask->nb[1] : 0,
++                    mask ? mask->nb[2] : 0,
++                    mask ? mask->nb[3] : 0,
++                    scale);
++        }
++    } else {
++        ggml_compute_forward_fused_cpp_sdpa_ext_impl(
++                q_h, k_h, v_h, mask_f32, mask_f16, o_h,
++                B, H_th, L, S, D, DV,
++                (int64_t) q->nb[0],   (int64_t) q->nb[1],   (int64_t) q->nb[2],   (int64_t) q->nb[3],
++                (int64_t) k->nb[0],   (int64_t) k->nb[1],   (int64_t) k->nb[2],   (int64_t) k->nb[3],
++                (int64_t) v->nb[0],   (int64_t) v->nb[1],   (int64_t) v->nb[2],   (int64_t) v->nb[3],
++                (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
++                mask ? mask->ne[0] : 0,
++                mask ? mask->ne[1] : 0,
++                mask ? mask->ne[2] : 0,
++                mask ? mask->ne[3] : 0,
++                mask ? mask->nb[0] : 0,
++                mask ? mask->nb[1] : 0,
++                mask ? mask->nb[2] : 0,
++                mask ? mask->nb[3] : 0,
++                scale);
++    }
++
++#else
++    GGML_UNUSED(params);
++    GGML_UNUSED(dst);
++    GGML_ABORT("fused_cpp fp32_packqkv sdpa is not enabled in this build");
++#endif
++}
++
+ // ggml_compute_forward_flash_attn_back
+ 
+ static void ggml_compute_forward_flash_attn_back_f32(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index dc081b9e..5b7109f6 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -76,6 +76,7 @@ void ggml_compute_forward_arange(const struct ggml_compute_params * params, stru
+ void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_argsort(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_fused_cpp_sdpa_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_flash_attn_ext(
+     const struct ggml_compute_params * params,
+     const struct ggml_tensor * q,
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 196b7b8f..acda47bb 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -76,6 +76,8 @@ float ggml_table_f32_f16[1 << 16];
+ #include <sys/prctl.h>
+ #endif
+ 
++#include <arm_sve.h>
++
+ #if defined(__ANDROID__)
+ #include <unwind.h>
+ #include <dlfcn.h>
+@@ -967,6 +969,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "LEAKY_RELU",
+ 
+     "FLASH_ATTN_EXT",
++    "FUSED_CPP_SDPA_EXT",
+     "FLASH_ATTN_BACK",
+     "SSM_CONV",
+     "SSM_SCAN",
+@@ -991,7 +994,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_ADAMW",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
++static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 83");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1062,6 +1065,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "leaky_relu(x)",
+ 
+     "flash_attn_ext(x)",
++    "fused_cpp_sdpa_ext(x)",
+     "flash_attn_back(x)",
+     "ssm_conv(x)",
+     "ssm_scan(x)",
+@@ -1086,7 +1090,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "adamw(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
++static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 83");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4470,6 +4474,43 @@ struct ggml_tensor * ggml_flash_attn_ext(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_fused_cpp_sdpa_ext(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * mask,
++        float                 scale) {
++    GGML_ASSERT(ggml_can_mul_mat(k, q));
++    GGML_ASSERT(q->type == GGML_TYPE_F32);
++    GGML_ASSERT(k->type == GGML_TYPE_F32);
++    GGML_ASSERT(v->type == GGML_TYPE_F32);
++
++    GGML_ASSERT(q->ne[2] == k->ne[2]);
++    GGML_ASSERT(q->ne[2] == v->ne[2]);
++    GGML_ASSERT(q->ne[3] == k->ne[3]);
++    GGML_ASSERT(q->ne[3] == v->ne[3]);
++
++    if (mask) {
++        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
++        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
++        GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
++    }
++
++    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    ggml_set_op_params(result, &scale, sizeof(scale));
++
++    result->op     = GGML_OP_FUSED_CPP_SDPA_EXT;
++    result->src[0] = q;
++    result->src[1] = k;
++    result->src[2] = v;
++    result->src[3] = mask;
++
++    return result;
++}
++
+ void ggml_flash_attn_ext_set_prec(
+         struct ggml_tensor * a,
+         enum ggml_prec       prec) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c4bdd660..68b714a4 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <cassert>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ 
+ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
+@@ -1058,6 +1059,35 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
+     return pos_bias;
+ }
+ 
++//
++// fused_cpp SDPA helpers
++//
++
++static bool build_attn_mha_fused_sdpa_env_is(const char * value) {
++    const char * env = std::getenv("GGML_FUSED_CPP_SDPA");
++    return env != nullptr && strcmp(env, value) == 0;
++}
++
++bool llm_graph_context::build_attn_mha_use_fused_sdpa() const {
++#if defined(__aarch64__) || defined(_M_ARM64)
++    const char * env = std::getenv("GGML_FUSED_CPP_SDPA");
++    if (env == nullptr || env[0] == '\0') {
++        return true; // default enabled
++    }
++    return !build_attn_mha_fused_sdpa_env_is("0")     &&
++           !build_attn_mha_fused_sdpa_env_is("off")   &&
++           !build_attn_mha_fused_sdpa_env_is("false") &&
++           !build_attn_mha_fused_sdpa_env_is("no");
++#else
++    return false;
++#endif
++}
++
++bool llm_graph_context::build_attn_mha_fused_sdpa_debug() {
++    return build_attn_mha_fused_sdpa_env_is("debug") ||
++           build_attn_mha_fused_sdpa_env_is("trace");
++}
++
+ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_cgraph * gf,
+          ggml_tensor * q,
+@@ -1077,10 +1107,66 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+     const auto n_head   = q->ne[2];
+     const auto n_kv     = k->ne[1];
+ 
++    const bool fused_sdpa_mask_supported = kq_mask == nullptr ||
++        ((kq_mask->type == GGML_TYPE_F16 || kq_mask->type == GGML_TYPE_F32) &&
++         ggml_is_contiguous(kq_mask) &&
++         kq_mask->ne[0] >= k->ne[1] &&
++         kq_mask->ne[1] >= q->ne[1] &&
++         kq_mask->ne[2] > 0 &&
++         kq_mask->ne[3] > 0 &&
++         q->ne[2] % kq_mask->ne[2] == 0 &&
++         q->ne[3] % kq_mask->ne[3] == 0);
++
++    // The fused SDPA (fp32_packqkv) path is numerically consistent with the
++    // matmul-based attention for all sequence lengths (verified against the
++    // reference build to cos>=0.9999 for n_tokens 1..512). A previous
++    // workaround skipped fused SDPA for n_tokens%16>=10, but the fallback
++    // matmul path then diverged from the reference for those lengths. Keep
++    // the fused path enabled for all lengths instead.
++    const bool use_fused_cpp_attn =
++        build_attn_mha_use_fused_sdpa() &&
++        backend_cpu != nullptr &&
++        v_mla == nullptr &&
++        hparams.f_max_alibi_bias == 0.0f &&
++        !hparams.attn_soft_cap &&
++        q->type == GGML_TYPE_F32 &&
++        k->type == GGML_TYPE_F32 &&
++        v->type == GGML_TYPE_F32 &&
++        q->ne[1] == k->ne[1] &&
++        k->ne[1] == v->ne[1] &&
++        q->ne[2] == k->ne[2] &&
++        q->ne[2] == v->ne[2] &&
++        q->ne[3] == k->ne[3] &&
++        q->ne[3] == v->ne[3] &&
++        q->nb[0] == ggml_type_size(q->type) &&
++        (v->ne[0] % 8) == 0 &&
++        fused_sdpa_mask_supported;
++
+     ggml_tensor * cur;
+ 
+     // TODO: replace hardcoded padding with ggml-provided padding
+-    if (cparams.flash_attn && (n_kv % 256 == 0) && kq_b == nullptr) {
++    if (use_fused_cpp_attn) {
++        if (build_attn_mha_fused_sdpa_debug()) {
++            LLAMA_LOG_INFO("%s: using fused_cpp SDPA: B=%lld H=%lld L=%lld S=%lld D=%lld DV=%lld mask=%s\n",
++                    __func__,
++                    (long long) q->ne[3],
++                    (long long) q->ne[2],
++                    (long long) q->ne[1],
++                    (long long) k->ne[2],
++                    (long long) q->ne[0],
++                    (long long) v->ne[0],
++                    kq_mask == nullptr ? "none" : ggml_type_name(kq_mask->type));
++        }
++
++        if (v_trans) {
++            v = ggml_transpose(ctx0, v);
++        }
++
++        cur = ggml_fused_cpp_sdpa_ext(ctx0, q, k, v, kq_mask, kq_scale);
++        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
++
++        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
++    } else if (cparams.flash_attn && (n_kv % 256 == 0) && kq_b == nullptr) {
+         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+ 
+         if (v_trans) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index d1c5dd1b..83c5344f 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -531,6 +531,10 @@ struct llm_graph_context {
+     // attention
+     //
+ 
++    bool build_attn_mha_use_fused_sdpa() const;
++
++    static bool build_attn_mha_fused_sdpa_debug();
++
+     ggml_tensor * build_attn_mha(
+              ggml_cgraph * gf,
+              ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+-- 
+2.43.0
+
