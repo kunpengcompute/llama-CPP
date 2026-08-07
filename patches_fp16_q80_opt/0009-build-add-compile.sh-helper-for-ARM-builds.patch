@@ -1,0 +1,43 @@
+From fec0f0f0ab62363aa452e30c132f75541907ad60 Mon Sep 17 00:00:00 2001
+From: Kaixin Liu <liukaixin1@h-partners.com>
+Date: Thu, 6 Aug 2026 16:20:24 +0800
+Subject: [PATCH 09/10] build: add compile.sh helper for ARM builds
+
+- build-fused-sdpa profile: -O3 -funroll-loops with armv8.6-a+dotprod+i8mm+sve
+- default profile: -O3 RelWithDebInfo; builds ggml-cpu, llama-embedding,
+  llama-bench and llama-server via ninja
+---
+ compile.sh | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+ create mode 100755 compile.sh
+
+diff --git a/compile.sh b/compile.sh
+new file mode 100755
+index 00000000..cec41977
+--- /dev/null
++++ b/compile.sh
+@@ -0,0 +1,21 @@
++# CFLAGS="-O3 -march=armv8.6-a+sve+i8mm+fp16+f32mm -fno-unroll-loops -fomit-frame-pointer -Wno-incompatible-pointer-types" CXXFLAGS="-O3 -march=armv8.6-a+sve+i8mm+fp16+f32mm -fno-unroll-loops -fomit-frame-pointer" cmake -B build-packA-1099bd .  -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF 
++# CFLAGS="-O3 -fno-unroll-loops -fomit-frame-pointer -Wno-incompatible-pointer-types" CXXFLAGS="-O3 -fno-unroll-loops -fomit-frame-pointer" cmake -B build-outer-5893 .  -DCMAKE_BUILD_TYPE=Debug -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF
++case $1 in
++  build-fused-sdpa)
++    _FLAGS="-O3 -funroll-loops -DNDEBUG"
++    env CFLAGS="$_FLAGS" CXXFLAGS="$_FLAGS" \
++      cmake -DCMAKE_BUILD_TYPE=Release \
++            -B $1 -GNinja \
++            -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF \
++            -DGGML_CPU_ARM_ARCH="armv8.6-a+dotprod+i8mm+sve" \
++            -DGGML_NATIVE=OFF
++    ;;
++  *)
++    _FLAGS="-O3 -funroll-loops"
++    env CFLAGS="$_FLAGS" CXXFLAGS="$_FLAGS" \
++      cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo \
++            -B $1 -GNinja \
++            -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF
++    ;;
++esac
++cmake --build $1 --config release --target ggml-cpu llama-embedding llama-bench llama-server -j 20 
+-- 
+2.43.0
+
