@@ -1,578 +1,731 @@
-From bc3e6922b6b9e3216e660020c145790ed832f66b Mon Sep 17 00:00:00 2001
+From dab2accef4273dd6155871bfe9c68cf7eef405d5 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
-Date: Thu, 6 Aug 2026 16:20:06 +0800
-Subject: [PATCH 07/10] feat(llama): add GGML fused SDPA op and integrate into
- graph
+Date: Thu, 6 Aug 2026 16:20:13 +0800
+Subject: [PATCH 08/10] feat(cpu): wire optimized matmul & fused SDPA kernels
+ into ggml dispatch
 
-- ggml.h / ggml.c: new GGML_OP_FUSED_CPP_SDPA_EXT op + ggml_fused_cpp_sdpa_ext()
-  (F32 q/k/v optional F16/F32 mask, MHA only)
-- ops.h/ops.cpp: ggml_compute_forward_fused_cpp_sdpa_ext with head-level
-  thread partitioning and 64x64 diagonal-block path for L==S
-- ggml-cpu/CMakeLists.txt: ARM build wires fused-cpp sources under
-  GGML_USE_FUSED_CPP_SDPA
-- llama-graph.cpp/h: build_attn_mha picks the fused SDPA path on aarch64
-  (env GGML_FUSED_CPP_SDPA can disable/debug)
+- type_traits_cpu: enable is_matmul_valid and hook matmul for F16 / Q8_0
+  (FP32 keeps the vec_dot path, matmul left commented out)
+- ggml_compute_forward_mul_mat: route F16/F32/Q8_0 matmuls to the new
+  packed micro-kernels (compute_forward_mul_mat_one_chunk_matmul_kernel),
+  add FP16 M-only scheduling and Q8_0 M-only scheduling heuristics
+- add GGML_OP_FUSED_CPP_SDPA_EXT compute + n_tasks dispatch cases
+- NEON fp16<->fp32 conversion fast paths in ggml_cpu_fp32_to_fp16 /
+  ggml_cpu_fp16_to_fp32
 ---
- ggml/include/ggml.h              |  11 ++
- ggml/src/ggml-cpu/CMakeLists.txt |  14 ++
- ggml/src/ggml-cpu/ops.cpp        | 241 ++++++++++++++++++++++++++++++-
- ggml/src/ggml-cpu/ops.h          |   1 +
- ggml/src/ggml.c                  |  45 +++++-
- src/llama-graph.cpp              |  88 ++++++++++-
- src/llama-graph.h                |   4 +
- 7 files changed, 400 insertions(+), 4 deletions(-)
+ ggml/src/ggml-cpu/ggml-cpu.c | 566 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 532 insertions(+), 34 deletions(-)
 
-diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 1a57f1cd..02bf7fc9 100644
---- a/ggml/include/ggml.h
-+++ b/ggml/include/ggml.h
-@@ -495,6 +495,7 @@ extern "C" {
-         GGML_OP_LEAKY_RELU,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index c7426df2..4954187f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -34,6 +34,8 @@
+ #include <limits.h>
+ #include <stdarg.h>
+ #include <signal.h>
++#include <fcntl.h>
++#include <unistd.h>
+ #if defined(__gnu_linux__)
+ #include <syscall.h>
+ #endif
+@@ -200,12 +202,16 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f32,
+         .vec_dot_type             = GGML_TYPE_F32,
+         .nrows                    = 1,
++        .is_matmul_valid          = true,
++        // .matmul                   = (matmul_f) matmul_outer_packA_b_g_b32,
+     },
+     [GGML_TYPE_F16] = {
+         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp16,
+         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f16,
+         .vec_dot_type             = GGML_TYPE_F16,
+         .nrows                    = 1,
++        .is_matmul_valid          = true,
++        .matmul                   = (matmul_f) matmul_outer_packA_b_g_b16,
+     },
+     [GGML_TYPE_Q4_0] = {
+         .from_float               = quantize_row_q4_0,
+@@ -248,6 +254,8 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+ #else
+         .nrows                    = 1,
+ #endif
++        .is_matmul_valid          = true,
++        .matmul                   = (matmul_f) matmul_q8_0_mmla_spack_b_g,
+     },
+     [GGML_TYPE_Q8_1] = {
+         .from_float               = quantize_row_q8_1,
+@@ -1168,6 +1176,315 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
  
-         GGML_OP_FLASH_ATTN_EXT,
-+        GGML_OP_FUSED_CPP_SDPA_EXT,
-         GGML_OP_FLASH_ATTN_BACK,
-         GGML_OP_SSM_CONV,
-         GGML_OP_SSM_SCAN,
-@@ -1857,6 +1858,16 @@ extern "C" {
-     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
-             const struct ggml_tensor * a);
+ // ggml_compute_forward_mul_mat
  
-+    // fused_cpp embedding SDPA path:
-+    // q/k/v/out are F32, MHA only (n_head == n_head_kv), mask is optional F16/F32.
-+    GGML_API struct ggml_tensor * ggml_fused_cpp_sdpa_ext(
-+            struct ggml_context * ctx,
-+            struct ggml_tensor  * q,
-+            struct ggml_tensor  * k,
-+            struct ggml_tensor  * v,
-+            struct ggml_tensor  * mask,
-+            float                 scale);
++void compute_forward_mul_mat_one_chunk_matmul_kernel(
++    const struct ggml_compute_params * params,
++    struct ggml_tensor * dst,
++    const enum ggml_type type,
++    const int64_t ir0_start,
++    const int64_t ir0_end,
++    const int64_t ir1_start,
++    const int64_t ir1_end) {
 +
-     // TODO: needs to be adapted to ggml_flash_attn_ext
-     GGML_API struct ggml_tensor * ggml_flash_attn_back(
-            struct ggml_context * ctx,
-diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
-index 33f66af8..19e4f27a 100644
---- a/ggml/src/ggml-cpu/CMakeLists.txt
-+++ b/ggml/src/ggml-cpu/CMakeLists.txt
-@@ -84,6 +84,18 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
- 
-     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
-         message(STATUS "ARM detected")
-+        set(GGML_FUSED_CPP_FP32_PACKQKV_DIR ggml-cpu/fused-cpp/fp32_packqkv)
-+        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-+            set_source_files_properties(${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/fp32_packqkv_sdpa.cpp PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden")
-+        endif()
-+        list(APPEND GGML_CPU_SOURCES
-+            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/fp32_packqkv_sdpa.cpp
-+            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/fp32_packqkv_sdpa.h
-+            )
-+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FUSED_CPP_SDPA GGML_FUSED_CPP_BUILTIN)
-+        target_include_directories(${GGML_CPU_NAME} PRIVATE
-+            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}
-+            ${GGML_FUSED_CPP_FP32_PACKQKV_DIR}/csrc)
-         if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
-             message(FATAL_ERROR "MSVC is not supported for ARM, use clang")
-         else()
-@@ -493,3 +505,5 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
-         set_target_properties(${GGML_CPU_NAME} PROPERTIES COMPILE_FLAGS "-msimd128")
-     endif()
- endfunction()
++    if (ir0_start >= ir0_end || ir1_start >= ir1_end) return;
++    const struct ggml_tensor * src0 = dst->src[0];
++    const struct ggml_tensor * src1 = dst->src[1];
 +
-+set(ARCH_FLAGS "-mcpu=hip09+crypto+fp16+rcpc+sha3+sm4+bf16+nodotprod+noprofile+nopredres+nof32mm+nof64mm+dotprod+noi8mm+sve")
-diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index d8de7531..f682c3a3 100644
---- a/ggml/src/ggml-cpu/ops.cpp
-+++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -6,7 +6,28 @@
- #include "unary-ops.h"
- #include "vec.h"
- 
--#include <float.h>
-+#if defined(GGML_USE_FUSED_CPP_SDPA)
-+#include "fused-cpp/fp32_packqkv/fp32_packqkv_sdpa.h"
-+#endif
++    const int64_t K = src0->ne[0];
 +
-+#include <algorithm>
-+#include <cfloat>
-+#include <cmath>
-+#include <cstdio>
-+#include <cstdlib>
-+#include <cstring>
++    enum ggml_type const matmul_type = type_traits_cpu[type].vec_dot_type;
 +
-+#if defined(GGML_USE_FUSED_CPP_SDPA)
-+static bool ggml_fused_cpp_sdpa_env_is(const char * value) {
-+    const char * env = std::getenv("GGML_FUSED_CPP_SDPA");
-+    return env != nullptr && strcmp(env, value) == 0;
-+}
++    assert(type_traits_cpu[type].is_matmul_valid);
++    matmul_f matmul = type_traits_cpu[type].matmul;
 +
-+static bool ggml_fused_cpp_sdpa_debug() {
-+    return ggml_fused_cpp_sdpa_env_is("debug") ||
-+           ggml_fused_cpp_sdpa_env_is("trace");
-+}
-+#endif
- 
- // ggml_compute_forward_dup
- 
-@@ -7185,6 +7206,224 @@ void ggml_compute_forward_flash_attn_ext(
-     }
- }
- 
-+static void ggml_compute_forward_fused_cpp_sdpa_ext_impl(
-+        const float * q,
-+        const float * k,
-+        const float * v,
-+        const float * mask_f32,
-+        const uint16_t * mask_f16,
-+              float * dst,
-+        int64_t B, int64_t H, int64_t L, int64_t S, int64_t D, int64_t DV,
-+        int64_t q_nb0, int64_t q_nb1, int64_t q_nb2, int64_t q_nb3,
-+        int64_t k_nb0, int64_t k_nb1, int64_t k_nb2, int64_t k_nb3,
-+        int64_t v_nb0, int64_t v_nb1, int64_t v_nb2, int64_t v_nb3,
-+        int64_t o_nb0, int64_t o_nb1, int64_t o_nb2, int64_t o_nb3,
-+        int64_t m_ne0, int64_t m_ne1, int64_t m_ne2, int64_t m_ne3,
-+        int64_t m_nb0, int64_t m_nb1, int64_t m_nb2, int64_t m_nb3,
-+        float scale) {
-+    int ret = 0;
-+    if (mask_f16 != nullptr) {
-+        ret = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f16(
-+                q, k, v, mask_f16, dst,
-+                B, H, L, S, D, DV,
-+                q_nb0, q_nb1, q_nb2, q_nb3,
-+                k_nb0, k_nb1, k_nb2, k_nb3,
-+                v_nb0, v_nb1, v_nb2, v_nb3,
-+                o_nb0, o_nb1, o_nb2, o_nb3,
-+                m_ne0, m_ne1, m_ne2, m_ne3,
-+                m_nb0, m_nb1, m_nb2, m_nb3,
-+                scale);
-+    } else if (mask_f32 != nullptr) {
-+        ret = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp_mask_f32(
-+                q, k, v, mask_f32, dst,
-+                B, H, L, S, D, DV,
-+                q_nb0, q_nb1, q_nb2, q_nb3,
-+                k_nb0, k_nb1, k_nb2, k_nb3,
-+                v_nb0, v_nb1, v_nb2, v_nb3,
-+                o_nb0, o_nb1, o_nb2, o_nb3,
-+                m_ne0, m_ne1, m_ne2, m_ne3,
-+                m_nb0, m_nb1, m_nb2, m_nb3,
-+                scale);
++    // A[M, K], B[N, K], C[M, N]
++    const uint8_t* GGML_RESTRICT A = (const uint8_t*)(src0->data);
++    const uint8_t* GGML_RESTRICT B = (const uint8_t*)(src1->data);
++    if (matmul_type != src1->type) {
++        B = (const uint8_t*)(params->wdata);
++    }
++    uint8_t* GGML_RESTRICT C = (uint8_t*)(dst->data);
++    const size_t k_row_size = ggml_row_size(matmul_type, src1->ne[0]);
++    size_t byte_off_A = ir0_start * k_row_size;
++    size_t byte_off_B = ir1_start * k_row_size;
++    const int64_t M_th = ir0_end - ir0_start;
++    const int64_t N_th = ir1_end - ir1_start;
++    // Downgrade when has leftovers for outer kernels
++    int64_t M_th_outer = M_th & ~(16 - 1);
++    int64_t N_th_outer = N_th & ~(8 - 1);
++    // fprintf(stderr, "M_th=%d,N_th=%d\n", M_th,N_th);
++    // fprintf(stderr, "M_th_outer=%d,N_th_outer=%d\n", M_th_outer,N_th_outer);
++    if(matmul_type == GGML_TYPE_F16 || matmul_type == GGML_TYPE_F32) {
++        matmul_f leftovers_kernel;
++        switch (matmul_type) {
++            case GGML_TYPE_F16:
++                leftovers_kernel = ggml_matmul_f16_4x4_kernel;
++                break;
++            case GGML_TYPE_F32:
++                leftovers_kernel = ggml_matmul_f32_4x4_kernel;
++                break;
++            default:
++                GGML_ASSERT(false);
++        }
++        if(K % 8 == 0) {
++            if((M_th_outer != M_th || N_th_outer != N_th) && (type == GGML_TYPE_F16 || type == GGML_TYPE_F32)) {
++                void* GGML_RESTRICT ptr_C_matmul = &C[ir0_start * dst->nb[0] + ir1_start * dst->nb[1]];
++                void* GGML_RESTRICT ptr_C_leftovers_1 = &C[(ir0_start + M_th_outer) * dst->nb[0] + ir1_start * dst->nb[1]];
++                void* GGML_RESTRICT ptr_C_leftovers_2 = &C[ir0_start * dst->nb[0] + (ir1_start + N_th_outer) * dst->nb[1]];
++                size_t c_column_bytes = dst->nb[1];
++                if (M_th_outer > 0 && N_th_outer > 0) {
++                    matmul(M_th_outer, N_th_outer, K, A + byte_off_A, B + byte_off_B, ptr_C_matmul, c_column_bytes);
++                }
++                if(M_th - M_th_outer > 0) {
++                    leftovers_kernel(M_th - M_th_outer, N_th, K,
++                                    A + byte_off_A + (M_th_outer*k_row_size),
++                                    B+byte_off_B,
++                                    ptr_C_leftovers_1,
++                                    c_column_bytes);
++                }
++                if(N_th - N_th_outer > 0) {
++                    leftovers_kernel(M_th_outer, N_th - N_th_outer, K,
++                                    A + byte_off_A,
++                                    B+byte_off_B + (N_th_outer*k_row_size),
++                                    ptr_C_leftovers_2,
++                                    c_column_bytes);
++                }
++            } else {
++                matmul(M_th, N_th, K, A + byte_off_A, B + byte_off_B, &C[ir0_start * dst->nb[0] + ir1_start * dst->nb[1]], dst->nb[1]);
++            }
++        } else {
++            leftovers_kernel(M_th, N_th, K, A + byte_off_A, B + byte_off_B, &C[ir0_start * dst->nb[0] + ir1_start * dst->nb[1]], dst->nb[1]);
++        }
++    } else if (matmul_type == GGML_TYPE_Q8_0) {
++        void* GGML_RESTRICT ptr_C_matmul = &C[ir0_start * dst->nb[0] + ir1_start * dst->nb[1]];
++        size_t c_column_bytes = dst->nb[1];
++        // fprintf(stderr, "run matmul for GGML_TYPE_Q8_0\n");
++        matmul(M_th, N_th, K, A + byte_off_A, B + byte_off_B, ptr_C_matmul, c_column_bytes);
 +    } else {
-+        ret = fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp(
-+                q, k, v, dst,
-+                B, H, L, S, D, DV,
-+                q_nb0, q_nb1, q_nb2, q_nb3,
-+                k_nb0, k_nb1, k_nb2, k_nb3,
-+                v_nb0, v_nb1, v_nb2, v_nb3,
-+                o_nb0, o_nb1, o_nb2, o_nb3,
-+                scale);
-+    }
-+    if (ret != 0) {
-+        GGML_ABORT("fused_cpp fp32_packqkv sdpa failed with code %d", ret);
++        GGML_ASSERT(false);
 +    }
 +}
 +
-+void ggml_compute_forward_fused_cpp_sdpa_ext(
-+        const ggml_compute_params * params,
-+        ggml_tensor * dst) {
-+#if defined(GGML_USE_FUSED_CPP_SDPA)
-+    GGML_ASSERT(dst->op == GGML_OP_FUSED_CPP_SDPA_EXT);
++static void compute_forward_mul_mat_one_chunk_matmul_kernel_fp32(
++    const struct ggml_compute_params * params,
++    struct ggml_tensor * dst,
++    const enum ggml_type type,
++    const int64_t ir0_start,
++    const int64_t ir0_end,
++    const int64_t ir1_start,
++    const int64_t ir1_end) {
 +
-+    const ggml_tensor * q    = dst->src[0];
-+    const ggml_tensor * k    = dst->src[1];
-+    const ggml_tensor * v    = dst->src[2];
-+    const ggml_tensor * mask = dst->src[3];
++    const struct ggml_tensor * src0 = dst->src[0];
++    const struct ggml_tensor * src1 = dst->src[1];
 +
-+    GGML_ASSERT(q->type == GGML_TYPE_F32);
-+    GGML_ASSERT(k->type == GGML_TYPE_F32);
-+    GGML_ASSERT(v->type == GGML_TYPE_F32);
-+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-+    GGML_ASSERT(q->ne[0] == k->ne[0]);
-+    GGML_ASSERT(k->ne[1] == v->ne[1]);
-+    GGML_ASSERT(q->ne[2] == k->ne[2]);
-+    GGML_ASSERT(q->ne[2] == v->ne[2]);
-+    GGML_ASSERT(q->ne[3] == k->ne[3]);
-+    GGML_ASSERT(q->ne[3] == v->ne[3]);
-+    GGML_ASSERT(dst->ne[0] == v->ne[0]);
-+    GGML_ASSERT(dst->ne[1] == q->ne[2]);
-+    GGML_ASSERT(dst->ne[2] == q->ne[1]);
-+    GGML_ASSERT(dst->ne[3] == q->ne[3]);
-+    GGML_ASSERT(q->nb[0] == ggml_type_size(q->type));
-+    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
++    GGML_TENSOR_BINARY_OP_LOCALS
 +
-+    float scale;
-+    memcpy(&scale, dst->op_params, sizeof(scale));
++    const bool src1_cont = ggml_is_contiguous(src1);
 +
-+    const int64_t B  = q->ne[3];
-+    const int64_t H  = q->ne[2];
-+    const int64_t L  = q->ne[1];
-+    const int64_t S  = k->ne[1];
-+    const int64_t D  = q->ne[0];
-+    const int64_t DV = v->ne[0];
++    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
++    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 +
-+    GGML_ASSERT((DV % 8) == 0);
++    // broadcast factors
++    const int64_t r2 = ne12 / ne02;
++    const int64_t r3 = ne13 / ne03;
 +
-+    const int n_task = params->nth;
-+    const int ith    = params->ith;
-+
-+    // partition heads across threads
-+    const int64_t h_per_task = (H + n_task - 1) / n_task;
-+    const int64_t h_start    = ith * h_per_task;
-+    const int64_t h_end      = MIN(h_start + h_per_task, H);
-+
-+    if (h_start >= h_end) {
++    // threads with no work simply yield (not sure if it helps)
++    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
 +        return;
 +    }
 +
-+    if (ggml_fused_cpp_sdpa_debug()) {
-+        fprintf(stderr, "%s: executing fused_cpp SDPA: B=%lld H=%lld[%lld..%lld) L=%lld S=%lld D=%lld DV=%lld mask=%s ith=%d/%d\n",
-+                __func__,
-+                (long long) B, (long long) h_start, (long long) h_end,
-+                (long long) L, (long long) S, (long long) D, (long long) DV,
-+                mask == nullptr ? "none" : ggml_type_name(mask->type),
-+                ith, n_task);
++    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
++    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
++
++    assert(ne12 % ne02 == 0);
++    assert(ne13 % ne03 == 0);
++
++    // block-tiling attempt
++    const int64_t blck_0 = 4;
++    const int64_t blck_1 = 4;
++    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
++        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
++            // Check if i02/i03 (src0 batch indices) would change within the 4x4 block.
++            // The 4x4 kernel assumes pr0 (src0 row pointers) are constant across all 4 ir1 rows.
++            // This is violated when i11 wraps at ne1 boundary, changing i12 -> i02 (if r2==1)
++            // or i13 -> i03 (if r3==1). Fall back to vec_dot in that case.
++            bool block_unsafe = false;
++            if (iir1 + blck_1 <= ir1_end) {
++                const int64_t first_i13 = iir1 / (ne12 * ne1);
++                const int64_t first_i12 = (iir1 - first_i13 * ne12 * ne1) / ne1;
++                const int64_t last_ir1  = iir1 + blck_1 - 1;
++                const int64_t last_i13  = last_ir1 / (ne12 * ne1);
++                const int64_t last_i12  = (last_ir1 - last_i13 * ne12 * ne1) / ne1;
++                if (first_i12 / r2 != last_i12 / r2 || first_i13 / r3 != last_i13 / r3) {
++                    block_unsafe = true;
++                }
++            }
++            // handle leftovers using vec_dot
++            if (block_unsafe || iir1 + blck_1 > ir1_end || iir0 + blck_0 > ir0_end) {
++                for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += 1) {
++                    const int64_t i13 = (ir1 / (ne12 * ne1));
++                    const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
++                    const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
++
++                    // broadcast src0 into src1
++                    const int64_t i03 = i13 / r3;
++                    const int64_t i02 = i12 / r2;
++
++                    const int64_t i1 = i11;
++                    const int64_t i2 = i12;
++                    const int64_t i3 = i13;
++
++                    const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
++                    float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
++
++                    const char * src1_col = src1_cont ?
++                        ((const char*)wdata + (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size):
++                        ((const char*)wdata + (i11 * nb11 + i12 * nb12 + i13 * nb13));
++
++                    float tmp4[4];
++                    int ni = 0;
++                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0, ++ni) {
++                        vec_dot(ne00, &tmp4[ni], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
++                    }
++                    for (int i = 0; i < ni; i++) {
++                        dst_col[iir0 + i] = tmp4[i];
++                    }
++                }
++            } else {
++                // for every 4x4, collect pr1[4], pr0[4]
++                const float32_t *pr1[4];
++                const float32_t *pr0[4];
++                float32_t *pdst[4];
++                for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += 1) {
++                    const int64_t i13 = (ir1 / (ne12 * ne1));
++                    const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
++                    const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
++
++                    // broadcast src0 into src1
++                    const int64_t i03 = i13 / r3;
++                    const int64_t i02 = i12 / r2;
++
++                    const int64_t i1 = i11;
++                    const int64_t i2 = i12;
++                    const int64_t i3 = i13;
++
++                    if (ir1 == iir1) {
++                        // Assert ir0 has same idx between ir1
++                        for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
++                            const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
++                            int64_t irb0 = ir0 - iir0;
++                            pr0[irb0] = (const float32_t*)(src0_row + ir0 * nb01);
++                        }
++                    }
++
++                    int64_t irb1 = ir1 - iir1;
++
++                    pr1[irb1] = (const float32_t*)(src1_cont ?
++                        ((const char*)wdata + (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size) :
++                        ((const char*)wdata + (i11 * nb11 + i12 * nb12 + i13 * nb13)));
++                    pdst[irb1] = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3)) + iir0;
++                }
++                #if 0
++                // scalar check
++                {
++                    float tmp[4][4];
++                    for (int64_t ib1 = 0; ib1 < 4; ib1++) {
++                        for (int64_t ib0 = 0; ib0 < 4; ib0++) {
++                            tmp[ib1][ib0] = 0.0f;
++                            for (int64_t k = 0; k < ne00; k++) {
++                                tmp[ib1][ib0] += pr0[ib0][k] * pr1[ib1][k];
++                            }
++                        }
++                    }
++                    for (int64_t ib1 = 0; ib1 < 4; ib1++) {
++                        for (int64_t ib0 = 0; ib0 < 4; ib0++) {
++                            pdst[ib1][ib0] = tmp[ib1][ib0];
++                        }
++                    }
++                }
++                #else
++                svfloat32_t acc00 = svdup_f32(0.0f);
++                svfloat32_t acc01 = svdup_f32(0.0f);
++                svfloat32_t acc02 = svdup_f32(0.0f);
++                svfloat32_t acc03 = svdup_f32(0.0f);
++                svfloat32_t acc10 = svdup_f32(0.0f);
++                svfloat32_t acc11 = svdup_f32(0.0f);
++                svfloat32_t acc12 = svdup_f32(0.0f);
++                svfloat32_t acc13 = svdup_f32(0.0f);
++                svfloat32_t acc20 = svdup_f32(0.0f);
++                svfloat32_t acc21 = svdup_f32(0.0f);
++                svfloat32_t acc22 = svdup_f32(0.0f);
++                svfloat32_t acc23 = svdup_f32(0.0f);
++                svfloat32_t acc30 = svdup_f32(0.0f);
++                svfloat32_t acc31 = svdup_f32(0.0f);
++                svfloat32_t acc32 = svdup_f32(0.0f);
++                svfloat32_t acc33 = svdup_f32(0.0f);
++                size_t vl = svcntw();
++                for (int64_t k = 0; k < ne00; k += vl) {
++                    svbool_t pg = svwhilelt_b32(k, ne00);
++                    svfloat32_t v00 = svld1_f32(pg, &pr0[0][k]);
++                    svfloat32_t v01 = svld1_f32(pg, &pr0[1][k]);
++                    svfloat32_t v02 = svld1_f32(pg, &pr0[2][k]);
++                    svfloat32_t v03 = svld1_f32(pg, &pr0[3][k]);
++                    svfloat32_t v10 = svld1_f32(pg, &pr1[0][k]);
++                    svfloat32_t v11 = svld1_f32(pg, &pr1[1][k]);
++                    svfloat32_t v12 = svld1_f32(pg, &pr1[2][k]);
++                    svfloat32_t v13 = svld1_f32(pg, &pr1[3][k]);
++                    acc00 = svmla_f32_m(pg, acc00, v00, v10);
++                    acc01 = svmla_f32_m(pg, acc01, v00, v11);
++                    acc02 = svmla_f32_m(pg, acc02, v00, v12);
++                    acc03 = svmla_f32_m(pg, acc03, v00, v13);
++                    acc10 = svmla_f32_m(pg, acc10, v01, v10);
++                    acc11 = svmla_f32_m(pg, acc11, v01, v11);
++                    acc12 = svmla_f32_m(pg, acc12, v01, v12);
++                    acc13 = svmla_f32_m(pg, acc13, v01, v13);
++                    acc20 = svmla_f32_m(pg, acc20, v02, v10);
++                    acc21 = svmla_f32_m(pg, acc21, v02, v11);
++                    acc22 = svmla_f32_m(pg, acc22, v02, v12);
++                    acc23 = svmla_f32_m(pg, acc23, v02, v13);
++                    acc30 = svmla_f32_m(pg, acc30, v03, v10);
++                    acc31 = svmla_f32_m(pg, acc31, v03, v11);
++                    acc32 = svmla_f32_m(pg, acc32, v03, v12);
++                    acc33 = svmla_f32_m(pg, acc33, v03, v13);
++                }
++                svbool_t pg_all = svptrue_b32();
++                float32_t r00 = svaddv_f32(pg_all, acc00);
++                float32_t r01 = svaddv_f32(pg_all, acc01);
++                float32_t r02 = svaddv_f32(pg_all, acc02);
++                float32_t r03 = svaddv_f32(pg_all, acc03);
++                float32_t r10 = svaddv_f32(pg_all, acc10);
++                float32_t r11 = svaddv_f32(pg_all, acc11);
++                float32_t r12 = svaddv_f32(pg_all, acc12);
++                float32_t r13 = svaddv_f32(pg_all, acc13);
++                float32_t r20 = svaddv_f32(pg_all, acc20);
++                float32_t r21 = svaddv_f32(pg_all, acc21);
++                float32_t r22 = svaddv_f32(pg_all, acc22);
++                float32_t r23 = svaddv_f32(pg_all, acc23);
++                float32_t r30 = svaddv_f32(pg_all, acc30);
++                float32_t r31 = svaddv_f32(pg_all, acc31);
++                float32_t r32 = svaddv_f32(pg_all, acc32);
++                float32_t r33 = svaddv_f32(pg_all, acc33);
++                pdst[0][0] = r00;
++                pdst[1][0] = r01;
++                pdst[2][0] = r02;
++                pdst[3][0] = r03;
++                pdst[0][1] = r10;
++                pdst[1][1] = r11;
++                pdst[2][1] = r12;
++                pdst[3][1] = r13;
++                pdst[0][2] = r20;
++                pdst[1][2] = r21;
++                pdst[2][2] = r22;
++                pdst[3][2] = r23;
++                pdst[0][3] = r30;
++                pdst[1][3] = r31;
++                pdst[2][3] = r32;
++                pdst[3][3] = r33;
++                #endif
++            }
++        }
 +    }
++}
 +
-+    // offset data pointers to the start of this thread's head range
-+    // q/k/v after permute(0,2,1,3) have shape [D, n_tokens, n_head, B];
-+    //   nb[2] is the stride for the n_head dimension (= D*4)
-+    // dst has shape [D, n_head, n_tokens, B];
-+    //   nb[1] is the stride for the n_head dimension (= D*4)
-+    const float * q_h = (const float *) q->data + h_start * (q->nb[2] / sizeof(float));
-+    const float * k_h = (const float *) k->data + h_start * (k->nb[2] / sizeof(float));
-+    const float * v_h = (const float *) v->data + h_start * (v->nb[2] / sizeof(float));
-+          float * o_h = (      float *) dst->data + h_start * (dst->nb[1] / sizeof(float));
-+
-+    const int64_t H_th = h_end - h_start;
-+
-+    const uint16_t * mask_f16 = (mask != nullptr && mask->type == GGML_TYPE_F16) ? (const uint16_t *) mask->data : nullptr;
-+    const float    * mask_f32 = (mask != nullptr && mask->type == GGML_TYPE_F32) ? (const float    *) mask->data : nullptr;
-+
-+    const int64_t BLK = 64;
+ static void ggml_compute_forward_mul_mat_one_chunk(
+     const struct ggml_compute_params * params,
+     struct ggml_tensor * dst,
+@@ -1247,7 +1564,14 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+                 //}
+ 
+                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
++                    vec_dot(ne00,
++                            &tmp[ir0 - iir0],
++                            (num_rows_per_vec_dot > 1 ? 16 : 0),
++                            src0_row + ir0 * nb01,
++                            (num_rows_per_vec_dot > 1 ? nb01 : 0),
++                            src1_col,
++                            (num_rows_per_vec_dot > 1 ? src1_col_stride : 0),
++                            num_rows_per_vec_dot);
+                 }
+ 
+                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+@@ -1273,6 +1597,7 @@ static void ggml_compute_forward_mul_mat(
+     enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
+     ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
+     int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
++    bool                     const is_matmul_valid      = type_traits_cpu[src0->type].is_matmul_valid;
+ 
+     GGML_ASSERT(ne0 == ne01);
+     GGML_ASSERT(ne1 == ne11);
+@@ -1288,7 +1613,7 @@ static void ggml_compute_forward_mul_mat(
+     GGML_ASSERT(nb0 <= nb1);
+     GGML_ASSERT(nb1 <= nb2);
+     GGML_ASSERT(nb2 <= nb3);
+-
++    // fprintf(stderr, "origin M=%d,N=%d,K=%d\n", ne0, ne1, ne00);
+     // nb01 >= nb00 - src0 is not transposed
+     //   compute by src0 rows
+ 
+@@ -1402,58 +1727,185 @@ UseGgmlGemm2:;
+         chunk_size = 64;
+     }
+ 
++    if(is_matmul_valid) {
++        if (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) {
++            chunk_size = g_chunk_size_outer_packA;
++        }
++        else if (src0->type == GGML_TYPE_Q8_0) {
++            chunk_size = g_chunk_size_q8_0_mmla_spack;
++        }
++    }
+     // distribute the work across the inner or outer loop based on which one is larger
+     // The number of chunks in the 0/1 dim.
+     // CEIL(nr0/chunk_size)
+     int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+     int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+-
+-    // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
+-    //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
+-    //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
+-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+-        // distribute the thread work across the inner or outer loop based on which one is larger
+-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
+-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
++    /*
++    * FP16 PackA matmul scheduling optimization.
++    *
++    * Current optimized micro-kernel:
++    *   M tile = 16
++    *   N tile = 8
++    *
++    * Current outer blocking:
++    *   M_BLK = g_chunk_size_outer_packA / 4
++    *   N_BLK = g_chunk_size_outer_packA
++    *
++    * For sufficiently large N, prefer splitting only along M:
++    *
++    *     nchunk0 = nth
++    *     nchunk1 = 1
++    *
++    * so each thread owns a different M range but processes the full N range.
++    *
++    * Benefit:
++    *
++    *     packA(M block)
++    *          |
++    *          +--> N block 0
++    *          +--> N block 1
++    *          +--> ...
++    *
++    * instead of splitting N across threads and packing the same A block again
++    * for every N chunk.
++    *
++    * Example, g_chunk_size_outer_packA = 128:
++    *
++    *     N = 512 -> 4 N blocks / packed A
++    *     N = 256 -> 2 N blocks / packed A
++    *
++    * We currently enable M-only scheduling when N contains at least two
++    * outer N blocks.
++    */
++    const int64_t matmul_m_tile = 16;
++    const int64_t matmul_n_block = g_chunk_size_outer_packA;
 +
 +    /*
-+    * 对角块 SDPA:
-+    * 适用于 L == S 的 prompt processing 场景。
++    * Only use this policy for the optimized FP16 PackA matmul path.
 +    *
-+    * 原始:
-+    *   L x S
++    * Conditions:
 +    *
-+    * 改后:
-+    *   多个 64 x 64 对角块
-+    *
-+    * 注意：这不是严格等价优化，正确性后面需要验证。
++    * 1. matmul kernel is available;
++    * 2. source weight type is F16;
++    * 3. N is large enough to reuse one packed-A block across >= 2 N blocks;
++    * 4. each thread receives at least one complete 16-M micro-kernel tile;
++    * 5. M can be divided evenly across threads;
++    * 6. each thread's M range remains 16-aligned.
 +    */
-+    if (L == S && L > BLK && (L % BLK) == 0) {
-+        for (int64_t l0 = 0; l0 < L; l0 += BLK) {
-+            const int64_t L_cur = BLK;
-+            const int64_t S_cur = BLK;
++    const bool prefer_m_only =
++            is_matmul_valid &&
++            src0->type == GGML_TYPE_F16 &&
++            nr1 >= 2 * matmul_n_block &&
++            nth > 0 &&
++            nr0 >= (int64_t) nth * matmul_m_tile &&
++            (nr0 % nth) == 0 &&
++            ((nr0 / nth) % matmul_m_tile) == 0;
++    const bool prefer_q8_m_only =
++            is_matmul_valid &&
++            src0->type == GGML_TYPE_Q8_0 &&
++            nth > 0 &&
++            nr0 >= (int64_t) nth * 8 &&
++            (nr0 % nth) == 0 &&
++            ((nr0 / nth) % 8) == 0;
++    if (prefer_q8_m_only || prefer_m_only) {
++        /*
++        * Examples:
++        *
++        * M=1024 N=512 nth=2:
++        *   nchunk0=2, nchunk1=1
++        *   each thread: M=512, N=512
++        *
++        * M=1024 N=512 nth=4:
++        *   nchunk0=4, nchunk1=1
++        *   each thread: M=256, N=512
++        *
++        * M=1024 N=256 nth=4:
++        *   nchunk0=4, nchunk1=1
++        *   each thread: M=256, N=256
++        */
++        nchunk0 = nth;
++        nchunk1 = 1;
 +
-+            const float * q_blk =
-+                q_h + l0 * (q->nb[1] / sizeof(float));
-+
-+            const float * k_blk =
-+                k_h + l0 * (k->nb[1] / sizeof(float));
-+
-+            const float * v_blk =
-+                v_h + l0 * (v->nb[1] / sizeof(float));
-+
-+            float * o_blk =
-+                o_h + l0 * (dst->nb[2] / sizeof(float));
-+
-+            const float * mask_f32_blk =
-+                mask_f32 ?
-+                mask_f32
-+                    + l0 * (mask->nb[1] / sizeof(float))
-+                    + l0 * (mask->nb[0] / sizeof(float))
-+                : nullptr;
-+
-+            const uint16_t * mask_f16_blk =
-+                mask_f16 ?
-+                mask_f16
-+                    + l0 * (mask->nb[1] / sizeof(uint16_t))
-+                    + l0 * (mask->nb[0] / sizeof(uint16_t))
-+                : nullptr;
-+
-+            ggml_compute_forward_fused_cpp_sdpa_ext_impl(
-+                    q_blk, k_blk, v_blk, mask_f32_blk, mask_f16_blk, o_blk,
-+                    B, H_th, L_cur, S_cur, D, DV,
-+                    (int64_t) q->nb[0],   (int64_t) q->nb[1],   (int64_t) q->nb[2],   (int64_t) q->nb[3],
-+                    (int64_t) k->nb[0],   (int64_t) k->nb[1],   (int64_t) k->nb[2],   (int64_t) k->nb[3],
-+                    (int64_t) v->nb[0],   (int64_t) v->nb[1],   (int64_t) v->nb[2],   (int64_t) v->nb[3],
-+                    (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
-+
-+                    mask ? S_cur       : 0,
-+                    mask ? L_cur       : 0,
-+                    mask ? mask->ne[2] : 0,
-+                    mask ? mask->ne[3] : 0,
-+                    mask ? mask->nb[0] : 0,
-+                    mask ? mask->nb[1] : 0,
-+                    mask ? mask->nb[2] : 0,
-+                    mask ? mask->nb[3] : 0,
-+                    scale);
-+        }
++    } else if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
++        // Existing generic fallback.
++        nchunk0 = nr0 > nr1 ? nth : 1;
++        nchunk1 = nr0 > nr1 ? 1 : nth;
+     }
+-
+     // The number of elements in each chunk
+     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+-
++    // if (ith == 0) {
++    //     fprintf(stderr,
++    //         "[MATMUL] M=%ld N=%ld K=%ld nth=%d "
++    //         "chunk_size=%d nchunk0=%ld nchunk1=%ld "
++    //         "dr0=%ld dr1=%ld numa=%d\n",
++    //         (long) nr0,
++    //         (long) nr1,
++    //         (long) ne00,
++    //         nth,
++    //         chunk_size,
++    //         (long) nchunk0,
++    //         (long) nchunk1,
++    //         (long) dr0,
++    //         (long) dr1,
++    //         ggml_is_numa());
++    // }
+     // The first chunk comes from our thread_id, the rest will get auto-assigned.
+     int current_chunk = ith;
+ 
+-    while (current_chunk < nchunk0 * nchunk1) {
+-        const int64_t ith0 = current_chunk % nchunk0;
+-        const int64_t ith1 = current_chunk / nchunk0;
++    if(is_matmul_valid) {
++        while (current_chunk < nchunk0 * nchunk1) {
++            const int64_t ith0 = current_chunk % nchunk0;
++            const int64_t ith1 = current_chunk / nchunk0;
+ 
+-        const int64_t ir0_start = dr0 * ith0;
+-        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
++            const int64_t ir0_start = dr0 * ith0;
++            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+ 
+-        const int64_t ir1_start = dr1 * ith1;
+-        const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
++            const int64_t ir1_start = dr1 * ith1;
++            const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+ 
+-        // dot kernels can handle 1 row and col at a time, but mmla kernels can process 2 rows and cols
+-        int64_t num_rows_per_vec_dot = vec_dot_num_rows;
++            if (src0->type == GGML_TYPE_F32 /* && !ggml_is_contiguous(dst->src[1]) */) {
++                compute_forward_mul_mat_one_chunk_matmul_kernel_fp32(params, dst, src0->type, ir0_start, ir0_end, ir1_start, ir1_end);
++            } else {
++                compute_forward_mul_mat_one_chunk_matmul_kernel(params, dst, src0->type, ir0_start, ir0_end, ir1_start, ir1_end);
++            }
+ 
+-        // these checks are needed to avoid crossing dim1 boundaries
+-        // can be optimized, but the logic would become more complicated, so keeping it like this for simplicity
+-        if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
+-            num_rows_per_vec_dot = 1;
+-        }
+-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
++            if (nth >= nchunk0 * nchunk1) {
++                break;
++            }
+ 
+-        if (nth >= nchunk0 * nchunk1) {
+-            break;
++            current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+         }
 +    } else {
-+        ggml_compute_forward_fused_cpp_sdpa_ext_impl(
-+                q_h, k_h, v_h, mask_f32, mask_f16, o_h,
-+                B, H_th, L, S, D, DV,
-+                (int64_t) q->nb[0],   (int64_t) q->nb[1],   (int64_t) q->nb[2],   (int64_t) q->nb[3],
-+                (int64_t) k->nb[0],   (int64_t) k->nb[1],   (int64_t) k->nb[2],   (int64_t) k->nb[3],
-+                (int64_t) v->nb[0],   (int64_t) v->nb[1],   (int64_t) v->nb[2],   (int64_t) v->nb[3],
-+                (int64_t) dst->nb[0], (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) dst->nb[3],
-+                mask ? mask->ne[0] : 0,
-+                mask ? mask->ne[1] : 0,
-+                mask ? mask->ne[2] : 0,
-+                mask ? mask->ne[3] : 0,
-+                mask ? mask->nb[0] : 0,
-+                mask ? mask->nb[1] : 0,
-+                mask ? mask->nb[2] : 0,
-+                mask ? mask->nb[3] : 0,
-+                scale);
-+    }
++        while (current_chunk < nchunk0 * nchunk1) {
++            const int64_t ith0 = current_chunk % nchunk0;
++            const int64_t ith1 = current_chunk / nchunk0;
 +
-+#else
-+    GGML_UNUSED(params);
-+    GGML_UNUSED(dst);
-+    GGML_ABORT("fused_cpp fp32_packqkv sdpa is not enabled in this build");
-+#endif
-+}
++            const int64_t ir0_start = dr0 * ith0;
++            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
 +
- // ggml_compute_forward_flash_attn_back
++            const int64_t ir1_start = dr1 * ith1;
++            const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
++
++            // dot kernels can handle 1 row and col at a time, but mmla kernels can process 2 rows and cols
++            int64_t num_rows_per_vec_dot = vec_dot_num_rows;
++
++            // these checks are needed to avoid crossing dim1 boundaries
++            // can be optimized, but the logic would become more complicated, so keeping it like this for simplicity
++            if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
++                num_rows_per_vec_dot = 1;
++            }
++            ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
++
++            if (nth >= nchunk0 * nchunk1) {
++                break;
++            }
  
- static void ggml_compute_forward_flash_attn_back_f32(
-diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
-index dc081b9e..5b7109f6 100644
---- a/ggml/src/ggml-cpu/ops.h
-+++ b/ggml/src/ggml-cpu/ops.h
-@@ -76,6 +76,7 @@ void ggml_compute_forward_arange(const struct ggml_compute_params * params, stru
- void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * params, struct ggml_tensor * dst);
- void ggml_compute_forward_argsort(const struct ggml_compute_params * params, struct ggml_tensor * dst);
- void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
-+void ggml_compute_forward_fused_cpp_sdpa_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
- void ggml_compute_forward_flash_attn_ext(
-     const struct ggml_compute_params * params,
-     const struct ggml_tensor * q,
-diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 196b7b8f..acda47bb 100644
---- a/ggml/src/ggml.c
-+++ b/ggml/src/ggml.c
-@@ -76,6 +76,8 @@ float ggml_table_f32_f16[1 << 16];
- #include <sys/prctl.h>
+-        current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
++            current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
++        }
+     }
+ }
+ 
+-// ggml_compute_forward_mul_mat_id
+-
+ #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
+ 
+ struct mmid_row_mapping {
+@@ -1713,7 +2165,14 @@ static void ggml_compute_forward_mul_mat_id(
+ }
+ 
+ /////////////////////////////////
+-
++// static inline uint64_t now_ns(void) {
++//     struct timespec ts;
++//     clock_gettime(CLOCK_MONOTONIC, &ts);
++//     return (uint64_t) ts.tv_sec * 1000000000ull + ts.tv_nsec;
++// }
++
++// static _Atomic uint64_t g_op_ns[GGML_OP_COUNT];
++// static _Atomic uint64_t g_op_cnt[GGML_OP_COUNT];
+ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+     GGML_ASSERT(params);
+ 
+@@ -1726,6 +2185,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+         return;
+     }
+ 
++    // uint64_t t0 = now_ns();
+     switch (tensor->op) {
+         case GGML_OP_DUP:
+             {
+@@ -1979,6 +2439,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_flash_attn_ext(params, tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor);
+             } break;
++        case GGML_OP_FUSED_CPP_SDPA_EXT:
++            {
++                ggml_compute_forward_fused_cpp_sdpa_ext(params, tensor);
++            } break;
+         case GGML_OP_FLASH_ATTN_BACK:
+             {
+                 int32_t t = ggml_get_op_params_i32(tensor, 0);
+@@ -2070,6 +2534,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+                 GGML_ABORT("fatal error");
+             }
+     }
++    // uint64_t dt = now_ns() - t0;
++    // atomic_fetch_add_explicit(&g_op_ns[tensor->op], dt, memory_order_relaxed);
++    // atomic_fetch_add_explicit(&g_op_cnt[tensor->op], 1, memory_order_relaxed);
+ }
+ 
+ // Android's libc implementation "bionic" does not support setting affinity
+@@ -2296,6 +2763,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = n_threads;
+             } break;
++        case GGML_OP_FUSED_CPP_SDPA_EXT:
++            {
++                n_tasks = n_threads;
++            } break;
+         case GGML_OP_WIN_PART:
+         case GGML_OP_WIN_UNPART:
+         case GGML_OP_GET_REL_POS:
+@@ -2885,7 +3356,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     }
+ 
+     ggml_barrier(state->threadpool);
+-
++    // for (int op = 0; op < GGML_OP_COUNT; ++op) {
++    //     uint64_t ns  = atomic_load_explicit(&g_op_ns[op], memory_order_relaxed);
++    //     uint64_t cnt = atomic_load_explicit(&g_op_cnt[op], memory_order_relaxed);
++
++    //     if (cnt > 0) {
++    //         fprintf(stderr,
++    //             "[op time] op=%s cnt=%lu time=%.3f ms avg=%.3f us\n",
++    //             ggml_op_name((enum ggml_op) op),
++    //             cnt,
++    //             ns / 1e6,
++    //             cnt ? (ns / 1e3 / cnt) : 0.0);
++    //     }
++    // }
+     return 0;
+ }
+ 
+@@ -3205,6 +3688,13 @@ void ggml_cpu_fp32_to_fp16(const float * x, ggml_fp16_t * y, int64_t n) {
+         __m128i y_vec = _mm_cvtps_ph(x_vec, _MM_FROUND_TO_NEAREST_INT);
+         _mm_storel_epi64((__m128i *)(y + i), y_vec);
+     }
++#elif defined(__ARM_NEON) && defined(__aarch64__)
++    for (; i + 7 < n; i += 8) {
++        float32x4_t x0 = vld1q_f32(x + i);
++        float32x4_t x1 = vld1q_f32(x + i + 4);
++        float16x8_t y_vec = vcombine_f16(vcvt_f16_f32(x0), vcvt_f16_f32(x1));
++        vst1q_f16((float16_t *)(y + i), y_vec);
++    }
  #endif
- 
-+#include <arm_sve.h>
-+
- #if defined(__ANDROID__)
- #include <unwind.h>
- #include <dlfcn.h>
-@@ -967,6 +969,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
-     "LEAKY_RELU",
- 
-     "FLASH_ATTN_EXT",
-+    "FUSED_CPP_SDPA_EXT",
-     "FLASH_ATTN_BACK",
-     "SSM_CONV",
-     "SSM_SCAN",
-@@ -991,7 +994,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
-     "OPT_STEP_ADAMW",
- };
- 
--static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
-+static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 83");
- 
- static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
-     "none",
-@@ -1062,6 +1065,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
-     "leaky_relu(x)",
- 
-     "flash_attn_ext(x)",
-+    "fused_cpp_sdpa_ext(x)",
-     "flash_attn_back(x)",
-     "ssm_conv(x)",
-     "ssm_scan(x)",
-@@ -1086,7 +1090,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
-     "adamw(x)",
- };
- 
--static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
-+static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 83");
- 
- static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
- 
-@@ -4470,6 +4474,43 @@ struct ggml_tensor * ggml_flash_attn_ext(
-     return result;
- }
- 
-+struct ggml_tensor * ggml_fused_cpp_sdpa_ext(
-+        struct ggml_context * ctx,
-+        struct ggml_tensor  * q,
-+        struct ggml_tensor  * k,
-+        struct ggml_tensor  * v,
-+        struct ggml_tensor  * mask,
-+        float                 scale) {
-+    GGML_ASSERT(ggml_can_mul_mat(k, q));
-+    GGML_ASSERT(q->type == GGML_TYPE_F32);
-+    GGML_ASSERT(k->type == GGML_TYPE_F32);
-+    GGML_ASSERT(v->type == GGML_TYPE_F32);
-+
-+    GGML_ASSERT(q->ne[2] == k->ne[2]);
-+    GGML_ASSERT(q->ne[2] == v->ne[2]);
-+    GGML_ASSERT(q->ne[3] == k->ne[3]);
-+    GGML_ASSERT(q->ne[3] == v->ne[3]);
-+
-+    if (mask) {
-+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
-+        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
-+        GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
+     for (; i < n; ++i) {
+         y[i] = GGML_FP32_TO_FP16(x[i]);
+@@ -3231,6 +3721,14 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
+         __m128 y_vec = _mm_cvtph_ps(x_vec);
+         _mm_storeu_ps(y + i, y_vec);
+     }
++#elif defined(__ARM_NEON) && defined(__aarch64__)
++    for (; i + 7 < n; i += 8) {
++        float16x8_t x_vec = vld1q_f16((const float16_t *)(x + i));
++        float32x4_t y0 = vcvt_f32_f16(vget_low_f16(x_vec));
++        float32x4_t y1 = vcvt_f32_f16(vget_high_f16(x_vec));
++        vst1q_f32(y + i, y0);
++        vst1q_f32(y + i + 4, y1);
 +    }
-+
-+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
-+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
-+
-+    ggml_set_op_params(result, &scale, sizeof(scale));
-+
-+    result->op     = GGML_OP_FUSED_CPP_SDPA_EXT;
-+    result->src[0] = q;
-+    result->src[1] = k;
-+    result->src[2] = v;
-+    result->src[3] = mask;
-+
-+    return result;
-+}
-+
- void ggml_flash_attn_ext_set_prec(
-         struct ggml_tensor * a,
-         enum ggml_prec       prec) {
-diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index c4bdd660..68b714a4 100644
---- a/src/llama-graph.cpp
-+++ b/src/llama-graph.cpp
-@@ -10,6 +10,7 @@
- 
- #include <cassert>
- #include <cmath>
-+#include <cstdlib>
- #include <cstring>
- 
- void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-@@ -1058,6 +1059,35 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
-     return pos_bias;
- }
- 
-+//
-+// fused_cpp SDPA helpers
-+//
-+
-+static bool build_attn_mha_fused_sdpa_env_is(const char * value) {
-+    const char * env = std::getenv("GGML_FUSED_CPP_SDPA");
-+    return env != nullptr && strcmp(env, value) == 0;
-+}
-+
-+bool llm_graph_context::build_attn_mha_use_fused_sdpa() const {
-+#if defined(__aarch64__) || defined(_M_ARM64)
-+    const char * env = std::getenv("GGML_FUSED_CPP_SDPA");
-+    if (env == nullptr || env[0] == '\0') {
-+        return true; // default enabled
-+    }
-+    return !build_attn_mha_fused_sdpa_env_is("0")     &&
-+           !build_attn_mha_fused_sdpa_env_is("off")   &&
-+           !build_attn_mha_fused_sdpa_env_is("false") &&
-+           !build_attn_mha_fused_sdpa_env_is("no");
-+#else
-+    return false;
-+#endif
-+}
-+
-+bool llm_graph_context::build_attn_mha_fused_sdpa_debug() {
-+    return build_attn_mha_fused_sdpa_env_is("debug") ||
-+           build_attn_mha_fused_sdpa_env_is("trace");
-+}
-+
- ggml_tensor * llm_graph_context::build_attn_mha(
-          ggml_cgraph * gf,
-          ggml_tensor * q,
-@@ -1077,10 +1107,66 @@ ggml_tensor * llm_graph_context::build_attn_mha(
-     const auto n_head   = q->ne[2];
-     const auto n_kv     = k->ne[1];
- 
-+    const bool fused_sdpa_mask_supported = kq_mask == nullptr ||
-+        ((kq_mask->type == GGML_TYPE_F16 || kq_mask->type == GGML_TYPE_F32) &&
-+         ggml_is_contiguous(kq_mask) &&
-+         kq_mask->ne[0] >= k->ne[1] &&
-+         kq_mask->ne[1] >= q->ne[1] &&
-+         kq_mask->ne[2] > 0 &&
-+         kq_mask->ne[3] > 0 &&
-+         q->ne[2] % kq_mask->ne[2] == 0 &&
-+         q->ne[3] % kq_mask->ne[3] == 0);
-+
-+    // The fused SDPA (fp32_packqkv) path is numerically consistent with the
-+    // matmul-based attention for all sequence lengths (verified against the
-+    // reference build to cos>=0.9999 for n_tokens 1..512). A previous
-+    // workaround skipped fused SDPA for n_tokens%16>=10, but the fallback
-+    // matmul path then diverged from the reference for those lengths. Keep
-+    // the fused path enabled for all lengths instead.
-+    const bool use_fused_cpp_attn =
-+        build_attn_mha_use_fused_sdpa() &&
-+        backend_cpu != nullptr &&
-+        v_mla == nullptr &&
-+        hparams.f_max_alibi_bias == 0.0f &&
-+        !hparams.attn_soft_cap &&
-+        q->type == GGML_TYPE_F32 &&
-+        k->type == GGML_TYPE_F32 &&
-+        v->type == GGML_TYPE_F32 &&
-+        q->ne[1] == k->ne[1] &&
-+        k->ne[1] == v->ne[1] &&
-+        q->ne[2] == k->ne[2] &&
-+        q->ne[2] == v->ne[2] &&
-+        q->ne[3] == k->ne[3] &&
-+        q->ne[3] == v->ne[3] &&
-+        q->nb[0] == ggml_type_size(q->type) &&
-+        (v->ne[0] % 8) == 0 &&
-+        fused_sdpa_mask_supported;
-+
-     ggml_tensor * cur;
- 
-     // TODO: replace hardcoded padding with ggml-provided padding
--    if (cparams.flash_attn && (n_kv % 256 == 0) && kq_b == nullptr) {
-+    if (use_fused_cpp_attn) {
-+        if (build_attn_mha_fused_sdpa_debug()) {
-+            LLAMA_LOG_INFO("%s: using fused_cpp SDPA: B=%lld H=%lld L=%lld S=%lld D=%lld DV=%lld mask=%s\n",
-+                    __func__,
-+                    (long long) q->ne[3],
-+                    (long long) q->ne[2],
-+                    (long long) q->ne[1],
-+                    (long long) k->ne[2],
-+                    (long long) q->ne[0],
-+                    (long long) v->ne[0],
-+                    kq_mask == nullptr ? "none" : ggml_type_name(kq_mask->type));
-+        }
-+
-+        if (v_trans) {
-+            v = ggml_transpose(ctx0, v);
-+        }
-+
-+        cur = ggml_fused_cpp_sdpa_ext(ctx0, q, k, v, kq_mask, kq_scale);
-+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
-+
-+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
-+    } else if (cparams.flash_attn && (n_kv % 256 == 0) && kq_b == nullptr) {
-         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
- 
-         if (v_trans) {
-diff --git a/src/llama-graph.h b/src/llama-graph.h
-index d1c5dd1b..83c5344f 100644
---- a/src/llama-graph.h
-+++ b/src/llama-graph.h
-@@ -531,6 +531,10 @@ struct llm_graph_context {
-     // attention
-     //
- 
-+    bool build_attn_mha_use_fused_sdpa() const;
-+
-+    static bool build_attn_mha_fused_sdpa_debug();
-+
-     ggml_tensor * build_attn_mha(
-              ggml_cgraph * gf,
-              ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+ #endif
+     for (; i < n; ++i) {
+         y[i] = GGML_FP16_TO_FP32(x[i]);
 -- 
 2.43.0
 
