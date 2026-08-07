@@ -1,0 +1,331 @@
+From 8b639de1dbab6baee353fdbbcaa6e1cdfd6d1e22 Mon Sep 17 00:00:00 2001
+From: Kaixin Liu <liukaixin1@h-partners.com>
+Date: Thu, 6 Aug 2026 16:18:45 +0800
+Subject: [PATCH 01/10] fix(common): fix baseline embedding/regex serv bugs,
+ add debug infra
+
+- common_embd_normalize: keep double-precision accumulation to avoid
+  fp32 overflow on long sequences; add omp simd reductions
+- common_embd_similarity_cos: use double accumulation
+- common: link OpenMP when GGML_OPENMP is on (needed by omp simd)
+- tools/server: fix trailing whitespace in embedding output path,
+  add reserve() helper used for embedding buffers
+- llama-model: name BERT intermediate tensors (L*_attn_out etc.) for debugging
+- llama-context: add gated tensor-dump block for precision debugging
+  (disabled by default, requires LLAMA_DUMP_DIR)
+---
+ common/CMakeLists.txt   |   7 ++
+ common/common.cpp       |  14 ++--
+ src/llama-context.cpp   | 140 ++++++++++++++++++++++++++++++++++++++++
+ src/llama-model.cpp     |   6 ++
+ tools/server/server.cpp |   2 +-
+ tools/server/utils.hpp  |   4 ++
+ 6 files changed, 167 insertions(+), 6 deletions(-)
+
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 564af144..101997bf 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -148,6 +148,13 @@ target_include_directories(${TARGET} PUBLIC . ../vendor)
+ target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+ target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+ 
++if (GGML_OPENMP)
++    find_package(OpenMP)
++    if (OpenMP_FOUND)
++        target_link_libraries(${TARGET} PRIVATE OpenMP::OpenMP_CXX)
++    endif()
++endif()
++
+ 
+ #
+ # copy the license files
+diff --git a/common/common.cpp b/common/common.cpp
+index 4cc40ed8..3430ad95 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1346,6 +1346,7 @@ void common_embd_normalize(const float * inp, float * out, int n, int embd_norm)
+             sum = 1.0;
+             break;
+         case 0: // max absolute
++            #pragma omp simd reduction(max:sum)
+             for (int i = 0; i < n; i++) {
+                 if (sum < std::abs(inp[i])) {
+                     sum = std::abs(inp[i]);
+@@ -1354,8 +1355,9 @@ void common_embd_normalize(const float * inp, float * out, int n, int embd_norm)
+             sum /= 32760.0; // make an int16 range
+             break;
+         case 2: // euclidean
++            #pragma omp simd reduction(+:sum)
+             for (int i = 0; i < n; i++) {
+-                sum += inp[i] * inp[i];
++                sum += (double)inp[i] * inp[i];
+             }
+             sum = std::sqrt(sum);
+             break;
+@@ -1367,8 +1369,9 @@ void common_embd_normalize(const float * inp, float * out, int n, int embd_norm)
+             break;
+     }
+ 
+-    const float norm = sum > 0.0 ? 1.0 / sum : 0.0f;
++    const float norm = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
+ 
++    #pragma omp simd
+     for (int i = 0; i < n; i++) {
+         out[i] = inp[i] * norm;
+     }
+@@ -1379,10 +1382,11 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
+     double sum1 = 0.0;
+     double sum2 = 0.0;
+ 
++    #pragma omp simd reduction(+:sum,sum1,sum2)
+     for (int i = 0; i < n; i++) {
+-        sum  += embd1[i] * embd2[i];
+-        sum1 += embd1[i] * embd1[i];
+-        sum2 += embd2[i] * embd2[i];
++        sum  += (double)embd1[i] * embd2[i];
++        sum1 += (double)embd1[i] * embd1[i];
++        sum2 += (double)embd2[i] * embd2[i];
+     }
+ 
+     // Handle the case where one or both vectors are zero vectors
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4ab57438..5f61cd52 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include <cinttypes>
+ #include <cstring>
++#include <cmath>
++#include <cstdlib>
+ #include <limits>
+ #include <stdexcept>
+ 
+@@ -687,6 +689,144 @@ llm_graph_result_ptr llama_context::process_ubatch(const llama_ubatch & ubatch,
+         return nullptr;
+     }
+ 
++    // Tensor dump for precision debugging
++    // Set LLAMA_DUMP_DIR to a writable directory like /tmp/dump_baseline or /tmp/dump_f16opt
++    // to dump all F32 intermediate tensor stats after graph compute.
++    // {
++    //     const char* dump_dir = getenv("LLAMA_DUMP_DIR");
++    //     if (dump_dir) {
++    //         const int n_nodes = ggml_graph_n_nodes(gf);
++
++    //         char path_buf[1024];
++    //         snprintf(path_buf, sizeof(path_buf), "mkdir -p %s", dump_dir);
++    //         system(path_buf);
++
++    //         static int64_t dump_call_count = 0;
++    //         dump_call_count++;
++
++    //         char call_dir[1024];
++    //         snprintf(call_dir, sizeof(call_dir), "%s/call_%04" PRId64, dump_dir, dump_call_count);
++    //         snprintf(path_buf, sizeof(path_buf), "mkdir -p %s", call_dir);
++    //         system(path_buf);
++
++    //         // Write metadata
++    //         snprintf(path_buf, sizeof(path_buf), "%s/meta.txt", call_dir);
++    //         FILE* meta = fopen(path_buf, "w");
++    //         if (meta) {
++    //             fprintf(meta, "n_nodes=%d n_tokens=%d\n", n_nodes, ubatch.n_tokens);
++    //             fclose(meta);
++    //         }
++
++    //         // Dump each node's stats
++    //         for (int i = 0; i < n_nodes; i++) {
++    //             struct ggml_tensor* t = ggml_graph_node(gf, i);
++    //             if (!t || !t->data) continue;
++
++    //             // Only dump F32 tensors that are results of operations
++    //             // (skip inputs/parameters/views)
++    //             if (t->type != GGML_TYPE_F32) continue;
++    //             if (t->op == GGML_OP_NONE) continue;
++    //             if (t->op == GGML_OP_VIEW) continue;
++    //             if (t->op == GGML_OP_RESHAPE) continue;
++    //             if (t->op == GGML_OP_PERMUTE) continue;
++    //             if (t->op == GGML_OP_TRANSPOSE) continue;
++    //             if (t->op == GGML_OP_CPY) continue;
++    //             if (t->op == GGML_OP_CONT) continue;
++
++    //             const char* name = ggml_get_name(t);
++    //             const char* op_name = ggml_op_name(t->op);
++    //             int64_t ne0 = t->ne[0];
++    //             int64_t ne1 = t->ne[1];
++    //             int64_t ne2 = t->ne[2];
++    //             int64_t ne3 = t->ne[3];
++
++    //             // Compute stats
++    //             float min_val = 0.0f, max_val = 0.0f;
++    //             double sum = 0.0, sum2 = 0.0;
++    //             int64_t n_elems = ggml_nelements(t);
++
++    //             if (n_elems > 0) {
++    //                 const float* data = (const float*)t->data;
++    //                 min_val = max_val = data[0];
++    //                 for (int64_t j = 0; j < n_elems && j < 100000; j++) {
++    //                     float v = data[j];
++    //                     if (v < min_val) min_val = v;
++    //                     if (v > max_val) max_val = v;
++    //                     sum += v;
++    //                     sum2 += (double)v * v;
++    //                 }
++    //                 // If more than 100k elements, subsample
++    //                 if (n_elems > 100000) {
++    //                     for (int64_t j = 100000; j < n_elems; j += 100) {
++    //                         float v = data[j];
++    //                         if (v < min_val) min_val = v;
++    //                         if (v > max_val) max_val = v;
++    //                         sum += v;
++    //                         sum2 += (double)v * v;
++    //                     }
++    //                     sum  = sum  * n_elems / (100000 + (n_elems - 100000 + 99) / 100);
++    //                     sum2 = sum2 * n_elems / (100000 + (n_elems - 100000 + 99) / 100);
++    //                 }
++    //             }
++
++    //             double norm = sqrt(sum2);
++
++    //             // Compute checksum (simple XOR of float bits)
++    //             uint32_t checksum = 0;
++    //             if (n_elems > 0 && n_elems <= 100000) {
++    //                 const float* data = (const float*)t->data;
++    //                 for (int64_t j = 0; j < n_elems; j++) {
++    //                     uint32_t bits;
++    //                     memcpy(&bits, &data[j], sizeof(bits));
++    //                     checksum ^= bits;
++    //                 }
++    //             }
++
++    //             // First 5 and last 5 elements
++    //             float first5[5] = {0};
++    //             float last5[5] = {0};
++    //             if (n_elems > 0) {
++    //                 const float* data = (const float*)t->data;
++    //                 int n_first = n_elems < 5 ? n_elems : 5;
++    //                 int n_last  = n_elems < 5 ? 0 : (n_elems < 10 ? n_elems - 5 : 5);
++    //                 for (int j = 0; j < n_first; j++) first5[j] = data[j];
++    //                 for (int j = 0; j < n_last;  j++) last5[j] = data[n_elems - n_last + j];
++    //             }
++
++    //             // Write tensor stats as single CSV line
++    //             char csv_path[1024];
++    //             snprintf(csv_path, sizeof(csv_path), "%s/tensors.csv", call_dir);
++    //             FILE* csv = fopen(csv_path, "a");
++    //             if (csv) {
++    //                 fprintf(csv, "%d,%s,%s,%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ","
++    //                         "%.10e,%.10e,%.10e,%.10e,%.10e,%08x,"
++    //                         "%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e\n",
++    //                         i, name ? name : "", op_name ? op_name : "",
++    //                         ne0, ne1, ne2, ne3,
++    //                         (double)(n_elems > 0 ? sum/n_elems : 0), norm,
++    //                         (double)min_val, (double)max_val,
++    //                         (double)(n_elems > 0 ? sum2/n_elems : 0),
++    //                         (unsigned)checksum,
++    //                         (double)first5[0], (double)first5[1], (double)first5[2],
++    //                         (double)first5[3], (double)first5[4],
++    //                         (double)(n_elems > 0 ? last5[0] : 0),
++    //                         (double)(n_elems > 0 ? last5[1] : 0),
++    //                         (double)(n_elems > 0 ? last5[2] : 0),
++    //                         (double)(n_elems > 0 ? last5[3] : 0),
++    //                         (double)(n_elems > 0 ? last5[4] : 0));
++    //                 fclose(csv);
++    //             }
++    //         }
++
++    //         // Also dump the full graph as a DOT file for visualization
++    //         char dot_path[1024];
++    //         snprintf(dot_path, sizeof(dot_path), "%s/graph.dot", call_dir);
++    //         ggml_graph_dump_dot(gf, NULL, dot_path);
++
++    //         LLAMA_LOG_INFO("%s: dumped %d tensors to %s\n", __func__, n_nodes, call_dir);
++    //     }
++    // }
++
+     ret = GGML_STATUS_SUCCESS;
+ 
+     return res;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index afef8487..01c42088 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -5906,6 +5906,7 @@ struct llm_build_bert : public llm_graph_context {
+         // embed layer norm
+         inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, -1);
+         cb(inpL, "inp_norm", -1);
++        ggml_set_name(inpL, "L0_inp_norm");
+ 
+         auto * inp_attn = build_attn_inp_no_cache();
+ 
+@@ -5977,6 +5978,7 @@ struct llm_build_bert : public llm_graph_context {
+                     model.layers[il].wo, model.layers[il].bo,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+             cb(cur, "kqv_out", il);
++            { char n[64]; snprintf(n,64,"L%d_attn_out",il); ggml_set_name(cur, n); }
+ 
+             if (il == n_layer - 1 && pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                 // skip computing output for unused tokens
+@@ -5990,6 +5992,7 @@ struct llm_build_bert : public llm_graph_context {
+ 
+             // attention layer norm
+             cur = build_norm(cur, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, il);
++            { char n[64]; snprintf(n,64,"L%d_attn_norm",il); ggml_set_name(cur, n); }
+ 
+             if (model.layers[il].attn_norm_2 != nullptr) {
+                 cur = ggml_add(ctx0, cur, inpL); // re-add the layer input
+@@ -6040,12 +6043,14 @@ struct llm_build_bert : public llm_graph_context {
+                         LLM_FFN_SILU, LLM_FFN_PAR, il);
+                 cb(cur, "ffn_out", il);
+             }
++            { char n[64]; snprintf(n,64,"L%d_ffn_out",il); ggml_set_name(cur, n); }
+ 
+             // attentions bypass the intermediate layer
+             cur = ggml_add(ctx0, cur, ffn_inp);
+ 
+             // output layer norm
+             cur = build_norm(cur, model.layers[il].layer_out_norm, model.layers[il].layer_out_norm_b, LLM_NORM, il);
++            { char n[64]; snprintf(n,64,"L%d_out_norm",il); ggml_set_name(cur, n); }
+ 
+             // input for next layer
+             inpL = cur;
+@@ -6054,6 +6059,7 @@ struct llm_build_bert : public llm_graph_context {
+         cur = inpL;
+ 
+         cb(cur, "result_embd", -1);
++        ggml_set_name(cur, "result_embd");
+         res->t_embd = cur;
+ 
+         ggml_build_forward_expand(gf, cur);
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 9038df4c..df93f898 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -2571,7 +2571,7 @@ struct server_context {
+             if (llama_pooling_type(slot.ctx) != LLAMA_POOLING_TYPE_NONE) {
+                 common_embd_normalize(embd, embd_res.data(), n_embd, 2);
+                 res->embedding.push_back(embd_res);
+-            } else {
++            } else {  
+                 res->embedding.push_back({ embd, embd + n_embd });
+             }
+         }
+diff --git a/tools/server/utils.hpp b/tools/server/utils.hpp
+index f3e0392a..6e40a33e 100644
+--- a/tools/server/utils.hpp
++++ b/tools/server/utils.hpp
+@@ -1187,6 +1187,10 @@ public:
+         tokens.clear();
+     }
+ 
++    void reserve(size_t n) {
++        tokens.reserve(n);
++    }
++
+     void keep_first(size_t n) {
+         GGML_ASSERT(n <= tokens.size());
+         if (has_mtmd) {
+-- 
+2.43.0
+
