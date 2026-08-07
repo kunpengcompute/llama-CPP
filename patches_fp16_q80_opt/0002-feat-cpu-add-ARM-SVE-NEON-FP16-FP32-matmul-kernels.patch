@@ -1,0 +1,2020 @@
+From c7a54ec041837af34d9c7149758dbcb75e90d4fb Mon Sep 17 00:00:00 2001
+From: Kaixin Liu <liukaixin1@h-partners.com>
+Date: Thu, 6 Aug 2026 16:18:57 +0800
+Subject: [PATCH 02/10] feat(cpu): add ARM SVE/NEON FP16 & FP32 matmul kernels
+
+- ggml-cpu.h: expose matmul type-trait hook (matmul_f, matmul_outer_pack_t,
+  is_matmul_valid) used by the new mul_mat dispatch path
+- vec.cpp/h: add optimized matmul kernels for the bge-m3 workload
+  - ggml_matmul_f32_4x4_kernel / ggml_matmul_f16_4x4_kernel (leftovers)
+  - matmul_outer_packA family: 8x16/4x16 f16 + 8x16 f32 micro-kernels,
+    neon f16 variant, pack-a driver with el_bits abstraction
+  - ggml_vec_scale_f32: fix SVE predicated tail (loop in ggml_f32_epr chunks)
+    so leftover elements past the first vector are always covered
+---
+ ggml/include/ggml-cpu.h   |   16 +
+ ggml/src/ggml-cpu/vec.cpp | 1787 ++++++++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cpu/vec.h   |  116 ++-
+ 3 files changed, 1893 insertions(+), 26 deletions(-)
+
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index de77a875..562adfac 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -109,13 +109,29 @@ extern "C" {
+     typedef void (*ggml_vec_dot_t)  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT x, size_t bx,
+                                        const void * GGML_RESTRICT y, size_t by, int nrc);
+ 
++    typedef void (*matmul_f)(size_t M, size_t N, int K,
++                            const void * GGML_RESTRICT x,
++                            const void * GGML_RESTRICT y,
++                            void * GGML_RESTRICT c,
++                            size_t c_column_bytes);
++
+     struct ggml_type_traits_cpu {
+         ggml_from_float_t        from_float;
+         ggml_vec_dot_t           vec_dot;
+         enum ggml_type           vec_dot_type;
+         int64_t                  nrows; // number of rows to process simultaneously
++        bool                     is_matmul_valid;
++        matmul_f                 matmul;
+     };
+ 
++    typedef struct matmul_outer_pack_t {
++        uint8_t* p;
++        size_t p_stride;
++        size_t sz_p;
++        size_t nr;
++        int dim;
++    } matmul_outer_pack_t;
++
+     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
+ 
+     GGML_BACKEND_API void ggml_cpu_init(void);
+diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
+index f7614568..8014c87d 100644
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -2,6 +2,12 @@
+ 
+ #include <cassert>
+ 
++// Suppress pre-existing warnings not from our changes
++#pragma GCC diagnostic ignored "-Wmissing-declarations"
++#pragma GCC diagnostic ignored "-Wcast-qual"
++#pragma GCC diagnostic ignored "-Wvla"
++#pragma GCC diagnostic ignored "-Wunused-parameter"
++
+ // precomputed gelu table for f16 (128 KB)
+ ggml_fp16_t ggml_table_gelu_f16[1 << 16];
+ 
+@@ -75,12 +81,14 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
+             ay1 = GGML_F32_VEC_LOAD(y + i);
+             sum1 = GGML_F32_VEC_FMA(ax1, ay1, sum1);
+         }
+-        // maximum number of leftover elements will be less that ggml_f32_epr. Apply predicated svmad on available elements only
++        // maximum number of leftover elements will be less that ggml_f32_epr. Apply predicated svmla on available elements only
++        // Note: must use svmla_f32_m (not svmad_f32_m) so that inactive lanes preserve sum1 (=op1, the destination)
++        // rather than op2 (which is 0 from predicated svld1). Otherwise the partial tail corrupts accumulator lanes.
+         if (np2 < n) {
+             svbool_t pg = svwhilelt_b32(np2, n);
+             ax1 = svld1_f32(pg, x + np2);
+             ay1 = svld1_f32(pg, y + np2);
+-            sum1 = svmad_f32_m(pg, ax1, ay1, sum1);
++            sum1 = svmla_f32_m(pg, sum1, ax1, ay1);
+         }
+         // reduce sum1,sum2 to sum1
+         GGML_F32_VEC_REDUCE(sumf, sum1, sum2, sum3, sum4, sum5, sum6, sum7, sum8);
+@@ -195,39 +203,1774 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
+     GGML_UNUSED(by);
+     GGML_UNUSED(bs);
+ 
+-    ggml_float sumf = 0.0;
++    // NEON optimized path: process 64 fp16 elements at a time with 8 NEON registers
++    // Software pipeline to hide load latency
++    const int np = (n & ~((1 << 6) - 1)); // 64-element aligned
+ 
+-#if defined(GGML_SIMD)
+-    const int np = (n & ~(GGML_F16_STEP - 1));
++    float16x8_t acc0 = vdupq_n_f16(0);
++    float16x8_t acc1 = vdupq_n_f16(0);
++    float16x8_t acc2 = vdupq_n_f16(0);
++    float16x8_t acc3 = vdupq_n_f16(0);
++    float16x8_t acc4 = vdupq_n_f16(0);
++    float16x8_t acc5 = vdupq_n_f16(0);
++    float16x8_t acc6 = vdupq_n_f16(0);
++    float16x8_t acc7 = vdupq_n_f16(0);
++
++    // Pre-load first 64 elements
++    float16x8_t ax0 = vld1q_f16((const __fp16 *)(x + 0));
++    float16x8_t ax1 = vld1q_f16((const __fp16 *)(x + 8));
++    float16x8_t ax2 = vld1q_f16((const __fp16 *)(x + 16));
++    float16x8_t ax3 = vld1q_f16((const __fp16 *)(x + 24));
++    float16x8_t ax4 = vld1q_f16((const __fp16 *)(x + 32));
++    float16x8_t ax5 = vld1q_f16((const __fp16 *)(x + 40));
++    float16x8_t ax6 = vld1q_f16((const __fp16 *)(x + 48));
++    float16x8_t ax7 = vld1q_f16((const __fp16 *)(x + 56));
++
++    float16x8_t ay0 = vld1q_f16((const __fp16 *)(y + 0));
++    float16x8_t ay1 = vld1q_f16((const __fp16 *)(y + 8));
++    float16x8_t ay2 = vld1q_f16((const __fp16 *)(y + 16));
++    float16x8_t ay3 = vld1q_f16((const __fp16 *)(y + 24));
++    float16x8_t ay4 = vld1q_f16((const __fp16 *)(y + 32));
++    float16x8_t ay5 = vld1q_f16((const __fp16 *)(y + 40));
++    float16x8_t ay6 = vld1q_f16((const __fp16 *)(y + 48));
++    float16x8_t ay7 = vld1q_f16((const __fp16 *)(y + 56));
++
++    int i = 64;
++    for (; i < np; i += 64) {
++        // Software pipeline: compute with previous data, load next
++        acc0 = vfmaq_f16(acc0, ax0, ay0);
++        ax0 = vld1q_f16((const __fp16 *)(x + i + 0));
++        ay0 = vld1q_f16((const __fp16 *)(y + i + 0));
++
++        acc1 = vfmaq_f16(acc1, ax1, ay1);
++        ax1 = vld1q_f16((const __fp16 *)(x + i + 8));
++        ay1 = vld1q_f16((const __fp16 *)(y + i + 8));
++
++        acc2 = vfmaq_f16(acc2, ax2, ay2);
++        ax2 = vld1q_f16((const __fp16 *)(x + i + 16));
++        ay2 = vld1q_f16((const __fp16 *)(y + i + 16));
++
++        acc3 = vfmaq_f16(acc3, ax3, ay3);
++        ax3 = vld1q_f16((const __fp16 *)(x + i + 24));
++        ay3 = vld1q_f16((const __fp16 *)(y + i + 24));
++
++        acc4 = vfmaq_f16(acc4, ax4, ay4);
++        ax4 = vld1q_f16((const __fp16 *)(x + i + 32));
++        ay4 = vld1q_f16((const __fp16 *)(y + i + 32));
++
++        acc5 = vfmaq_f16(acc5, ax5, ay5);
++        ax5 = vld1q_f16((const __fp16 *)(x + i + 40));
++        ay5 = vld1q_f16((const __fp16 *)(y + i + 40));
++
++        acc6 = vfmaq_f16(acc6, ax6, ay6);
++        ax6 = vld1q_f16((const __fp16 *)(x + i + 48));
++        ay6 = vld1q_f16((const __fp16 *)(y + i + 48));
++
++        acc7 = vfmaq_f16(acc7, ax7, ay7);
++        ax7 = vld1q_f16((const __fp16 *)(x + i + 56));
++        ay7 = vld1q_f16((const __fp16 *)(y + i + 56));
++    }
+ 
+-    GGML_F16_VEC sum[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
++    // Epilogue: process last block (already loaded, no more loads)
++    acc0 = vfmaq_f16(acc0, ax0, ay0);
++    acc1 = vfmaq_f16(acc1, ax1, ay1);
++    acc2 = vfmaq_f16(acc2, ax2, ay2);
++    acc3 = vfmaq_f16(acc3, ax3, ay3);
++    acc4 = vfmaq_f16(acc4, ax4, ay4);
++    acc5 = vfmaq_f16(acc5, ax5, ay5);
++    acc6 = vfmaq_f16(acc6, ax6, ay6);
++    acc7 = vfmaq_f16(acc7, ax7, ay7);
+ 
+-    GGML_F16_VEC ax[GGML_F16_ARR];
+-    GGML_F16_VEC ay[GGML_F16_ARR];
++    // Horizontal sum: sum all 8 acc vectors into one scalar
++    float16x8_t sum = vpaddq_f16(acc0, acc1);
++    float16x8_t sum2 = vpaddq_f16(acc2, acc3);
++    float16x8_t sum3 = vpaddq_f16(acc4, acc5);
++    float16x8_t sum4 = vpaddq_f16(acc6, acc7);
++    sum = vpaddq_f16(sum, sum2);
++    sum3 = vpaddq_f16(sum3, sum4);
++    sum = vpaddq_f16(sum, sum3);
++    // Now sum has 8 partial sums, need one more step
++    float32_t r0 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(sum))) +
++                   vaddvq_f32(vcvt_f32_f16(vget_high_f16(sum)));
++    ggml_float sumf = (ggml_float)r0;
+ 
+-    for (int i = 0; i < np; i += GGML_F16_STEP) {
+-        for (int j = 0; j < GGML_F16_ARR; j++) {
+-            ax[j] = GGML_F16_VEC_LOAD(x + i + j*GGML_F16_EPR, j);
+-            ay[j] = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
++    // leftovers (0-63 elements)
++    for (int i2 = np; i2 < n; ++i2) {
++        sumf += (ggml_float)(GGML_FP16_TO_FP32(x[i2])*GGML_FP16_TO_FP32(y[i2]));
++    }
++
++    *s = (float)sumf;
++}
+ 
+-            sum[j] = GGML_F16_VEC_FMA(sum[j], ax[j], ay[j]);
++float16x8_t svget_neonq_f16(svfloat16_t sve_vec) {
++    // return svget_neonq(sve_vec);
++    float16_t v[svcnth()];
++    svst1(svptrue_b16(), v, sve_vec);
++    return vld1q_f16(v);
++}
++
++void ggml_matmul_f32_4x4_kernel(size_t na, size_t nb, int dim,
++               const void* GGML_RESTRICT a, const void* GGML_RESTRICT b,
++               void* GGML_RESTRICT c, size_t c_column_bytes)
++{
++    // fprintf(stderr, "%s(na=%lu, nb=%lu, dim=%d)\n", __func__, na, nb, dim);
++    const size_t M = na;
++    const size_t N = nb;
++    const size_t K = dim;
++    const float32_t* GGML_RESTRICT A = (float32_t*)(a);
++    const float32_t* GGML_RESTRICT B = (float32_t*)(b);
++    float32_t* GGML_RESTRICT C = (float32_t*)(c);
++    size_t c_stride = c_column_bytes / sizeof(float32_t);
++    for (size_t i = 0; i < N; i++) {
++        for (size_t j = 0; j < M; j++) {
++            // for (int k = 0; k < dim; k++) {
++            //     C[i * c_stride + j] += A[j * dim + k] * B[i * dim + k];
++            // }
++            ggml_vec_dot_f32(dim, &C[(i * c_stride) + j], 0, &A[j * dim], 0, &B[i * dim], 0, 1);
++        }
++    }
++    return;
++    const size_t vl = svcntw();
++    svbool_t pg_all = svptrue_b8();
++    (void)pg_all;
++    (void)vl;
++    size_t N_rounded = N & ~((1 << 2) - 1);
++    size_t M_rounded = M & ~((1 << 2) - 1);
++    svfloat32_t acc00, acc01, acc02, acc03, acc10, acc11, acc12, acc13, acc20, acc21, acc22, acc23, acc30, acc31, acc32,
++      acc33;
++    // const float zero_f32_x[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++    svfloat32_t zero = svdup_f32(0);
++    for (size_t i = 0; i < N_rounded; i += 4) {
++        for (size_t j = 0; j < M_rounded; j += 4) {
++// #define LOAD_ZERO(acc) asm volatile("ld1w {%0.d}, %2/z, [%1]\n\t" : "=w"(acc) : "r"(zero_f32_x), "Upl"(pg_all) :);
++#define LOAD_ZERO(acc) (acc) = zero;
++            LOAD_ZERO(acc00);
++            LOAD_ZERO(acc01);
++            LOAD_ZERO(acc02);
++            LOAD_ZERO(acc03);
++            LOAD_ZERO(acc10);
++            LOAD_ZERO(acc11);
++            LOAD_ZERO(acc12);
++            LOAD_ZERO(acc13);
++            LOAD_ZERO(acc20);
++            LOAD_ZERO(acc21);
++            LOAD_ZERO(acc22);
++            LOAD_ZERO(acc23);
++            LOAD_ZERO(acc30);
++            LOAD_ZERO(acc31);
++            LOAD_ZERO(acc32);
++            LOAD_ZERO(acc33);
++#undef LOAD_ZERO
++            for (size_t k = 0; k < K; k += vl) {
++                svbool_t pg = svwhilelt_b32(k, K);
++                svfloat32_t j0 = svld1_f32(pg, &A[(j + 0) * K + k]);
++                svfloat32_t j1 = svld1_f32(pg, &A[(j + 1) * K + k]);
++                svfloat32_t j2 = svld1_f32(pg, &A[(j + 2) * K + k]);
++                svfloat32_t j3 = svld1_f32(pg, &A[(j + 3) * K + k]);
++                svfloat32_t i0 = svld1_f32(pg, &B[(i + 0) * K + k]);
++                svfloat32_t i1 = svld1_f32(pg, &B[(i + 1) * K + k]);
++                svfloat32_t i2 = svld1_f32(pg, &B[(i + 2) * K + k]);
++                svfloat32_t i3 = svld1_f32(pg, &B[(i + 3) * K + k]);
++                acc00 = svmla_f32_m(pg, acc00, i0, j0);
++                acc01 = svmla_f32_m(pg, acc01, i0, j1);
++                acc02 = svmla_f32_m(pg, acc02, i0, j2);
++                acc03 = svmla_f32_m(pg, acc03, i0, j3);
++                acc10 = svmla_f32_m(pg, acc10, i1, j0);
++                acc11 = svmla_f32_m(pg, acc11, i1, j1);
++                acc12 = svmla_f32_m(pg, acc12, i1, j2);
++                acc13 = svmla_f32_m(pg, acc13, i1, j3);
++                acc20 = svmla_f32_m(pg, acc20, i2, j0);
++                acc21 = svmla_f32_m(pg, acc21, i2, j1);
++                acc22 = svmla_f32_m(pg, acc22, i2, j2);
++                acc23 = svmla_f32_m(pg, acc23, i2, j3);
++                acc30 = svmla_f32_m(pg, acc30, i3, j0);
++                acc31 = svmla_f32_m(pg, acc31, i3, j1);
++                acc32 = svmla_f32_m(pg, acc32, i3, j2);
++                acc33 = svmla_f32_m(pg, acc33, i3, j3);
++            }
++            svbool_t pg_all = svptrue_b16();
++            float32_t r00 = svaddv_f32(pg_all, acc00);
++            float32_t r01 = svaddv_f32(pg_all, acc01);
++            float32_t r02 = svaddv_f32(pg_all, acc02);
++            float32_t r03 = svaddv_f32(pg_all, acc03);
++            float32_t r10 = svaddv_f32(pg_all, acc10);
++            float32_t r11 = svaddv_f32(pg_all, acc11);
++            float32_t r12 = svaddv_f32(pg_all, acc12);
++            float32_t r13 = svaddv_f32(pg_all, acc13);
++            float32_t r20 = svaddv_f32(pg_all, acc20);
++            float32_t r21 = svaddv_f32(pg_all, acc21);
++            float32_t r22 = svaddv_f32(pg_all, acc22);
++            float32_t r23 = svaddv_f32(pg_all, acc23);
++            float32_t r30 = svaddv_f32(pg_all, acc30);
++            float32_t r31 = svaddv_f32(pg_all, acc31);
++            float32_t r32 = svaddv_f32(pg_all, acc32);
++            float32_t r33 = svaddv_f32(pg_all, acc33);
++            C[((i + 0) * c_stride) + (j + 0)] = r00;
++            C[((i + 0) * c_stride) + (j + 1)] = r01;
++            C[((i + 0) * c_stride) + (j + 2)] = r02;
++            C[((i + 0) * c_stride) + (j + 3)] = r03;
++            C[((i + 1) * c_stride) + (j + 0)] = r10;
++            C[((i + 1) * c_stride) + (j + 1)] = r11;
++            C[((i + 1) * c_stride) + (j + 2)] = r12;
++            C[((i + 1) * c_stride) + (j + 3)] = r13;
++            C[((i + 2) * c_stride) + (j + 0)] = r20;
++            C[((i + 2) * c_stride) + (j + 1)] = r21;
++            C[((i + 2) * c_stride) + (j + 2)] = r22;
++            C[((i + 2) * c_stride) + (j + 3)] = r23;
++            C[((i + 3) * c_stride) + (j + 0)] = r30;
++            C[((i + 3) * c_stride) + (j + 1)] = r31;
++            C[((i + 3) * c_stride) + (j + 2)] = r32;
++            C[((i + 3) * c_stride) + (j + 3)] = r33;
++        }
++    }
++    // Handle leftovers with dot
++    for (size_t i = 0; i < N; i++) {
++        for (size_t j = M_rounded; j < M; j++) {
++            ggml_vec_dot_f32(dim, &C[(i * c_stride) + j], 0, &A[j * dim], 0, &B[i * dim], 0, 1);
+         }
+     }
++    for (size_t i = N_rounded; i < N; i++) {
++        for (size_t j = 0; j < M; j++) {
++            ggml_vec_dot_f32(dim, &C[(i * c_stride) + j], 0, &A[j * dim], 0, &B[i * dim], 0, 1);
++        }
++    }
++}
++
++// Performance-first SVE 1x8 kernel for fixed 256-bit SVE
++// Assumption: SVE vector length = 256-bit = 16 fp16 lanes
++// M == 1 decode fast path
++static inline void
++ggml_matmul_f16_1xn_kernel_sve(size_t N, size_t K,
++                               const ggml_fp16_t * GGML_RESTRICT A,
++                               const ggml_fp16_t * GGML_RESTRICT B,
++                               float32_t * GGML_RESTRICT C,
++                               size_t c_stride) {
++    const svbool_t pg = svptrue_b16();
+ 
+-    // reduce sum0..sum3 to sum0
+-    GGML_F16_VEC_REDUCE(sumf, sum);
++    // 256-bit SVE: 16 fp16 lanes
++    const size_t K_STEP  = 16;
++    const size_t K_STEP2 = 32;
+ 
+-    // leftovers
+-    for (int i = np; i < n; ++i) {
+-        sumf += (ggml_float)(GGML_FP16_TO_FP32(x[i])*GGML_FP16_TO_FP32(y[i]));
++    const size_t K_rounded2 = K & ~(K_STEP2 - 1);
++    const size_t K_rounded1 = K & ~(K_STEP  - 1);
++
++    size_t i = 0;
++
++    // Main path: compute 8 output channels at once.
++    // This reuses one A vector for 8 B rows.
++    for (; i + 8 <= N; i += 8) {
++        svfloat16_t acc0 = svdup_f16(0.0f);
++        svfloat16_t acc1 = svdup_f16(0.0f);
++        svfloat16_t acc2 = svdup_f16(0.0f);
++        svfloat16_t acc3 = svdup_f16(0.0f);
++        svfloat16_t acc4 = svdup_f16(0.0f);
++        svfloat16_t acc5 = svdup_f16(0.0f);
++        svfloat16_t acc6 = svdup_f16(0.0f);
++        svfloat16_t acc7 = svdup_f16(0.0f);
++
++        size_t k = 0;
++
++        // Unroll K by 2 vectors to reduce loop overhead and give compiler more scheduling room.
++        for (; k < K_rounded2; k += K_STEP2) {
++            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
++
++            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k]);
++            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k]);
++            svfloat16_t b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k]);
++            svfloat16_t b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k]);
++            svfloat16_t b4 = svld1_f16(pg, (const __fp16 *) &B[(i + 4) * K + k]);
++            svfloat16_t b5 = svld1_f16(pg, (const __fp16 *) &B[(i + 5) * K + k]);
++            svfloat16_t b6 = svld1_f16(pg, (const __fp16 *) &B[(i + 6) * K + k]);
++            svfloat16_t b7 = svld1_f16(pg, (const __fp16 *) &B[(i + 7) * K + k]);
++
++            acc0 = svmla_f16_m(pg, acc0, a0, b0);
++            acc1 = svmla_f16_m(pg, acc1, a0, b1);
++            acc2 = svmla_f16_m(pg, acc2, a0, b2);
++            acc3 = svmla_f16_m(pg, acc3, a0, b3);
++            acc4 = svmla_f16_m(pg, acc4, a0, b4);
++            acc5 = svmla_f16_m(pg, acc5, a0, b5);
++            acc6 = svmla_f16_m(pg, acc6, a0, b6);
++            acc7 = svmla_f16_m(pg, acc7, a0, b7);
++
++            svfloat16_t a1 = svld1_f16(pg, (const __fp16 *) &A[k + K_STEP]);
++
++            b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k + K_STEP]);
++            b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k + K_STEP]);
++            b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k + K_STEP]);
++            b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k + K_STEP]);
++            b4 = svld1_f16(pg, (const __fp16 *) &B[(i + 4) * K + k + K_STEP]);
++            b5 = svld1_f16(pg, (const __fp16 *) &B[(i + 5) * K + k + K_STEP]);
++            b6 = svld1_f16(pg, (const __fp16 *) &B[(i + 6) * K + k + K_STEP]);
++            b7 = svld1_f16(pg, (const __fp16 *) &B[(i + 7) * K + k + K_STEP]);
++
++            acc0 = svmla_f16_m(pg, acc0, a1, b0);
++            acc1 = svmla_f16_m(pg, acc1, a1, b1);
++            acc2 = svmla_f16_m(pg, acc2, a1, b2);
++            acc3 = svmla_f16_m(pg, acc3, a1, b3);
++            acc4 = svmla_f16_m(pg, acc4, a1, b4);
++            acc5 = svmla_f16_m(pg, acc5, a1, b5);
++            acc6 = svmla_f16_m(pg, acc6, a1, b6);
++            acc7 = svmla_f16_m(pg, acc7, a1, b7);
++        }
++
++        // One remaining full SVE vector.
++        if (k < K_rounded1) {
++            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
++
++            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k]);
++            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k]);
++            svfloat16_t b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k]);
++            svfloat16_t b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k]);
++            svfloat16_t b4 = svld1_f16(pg, (const __fp16 *) &B[(i + 4) * K + k]);
++            svfloat16_t b5 = svld1_f16(pg, (const __fp16 *) &B[(i + 5) * K + k]);
++            svfloat16_t b6 = svld1_f16(pg, (const __fp16 *) &B[(i + 6) * K + k]);
++            svfloat16_t b7 = svld1_f16(pg, (const __fp16 *) &B[(i + 7) * K + k]);
++
++            acc0 = svmla_f16_m(pg, acc0, a0, b0);
++            acc1 = svmla_f16_m(pg, acc1, a0, b1);
++            acc2 = svmla_f16_m(pg, acc2, a0, b2);
++            acc3 = svmla_f16_m(pg, acc3, a0, b3);
++            acc4 = svmla_f16_m(pg, acc4, a0, b4);
++            acc5 = svmla_f16_m(pg, acc5, a0, b5);
++            acc6 = svmla_f16_m(pg, acc6, a0, b6);
++            acc7 = svmla_f16_m(pg, acc7, a0, b7);
++
++            k += K_STEP;
++        }
++
++        // K tail: 1..15 fp16
++        if (k < K) {
++            svbool_t pg_tail = svwhilelt_b16(k, K);
++
++            svfloat16_t a0 = svld1_f16(pg_tail, (const __fp16 *) &A[k]);
++
++            svfloat16_t b0 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 0) * K + k]);
++            svfloat16_t b1 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 1) * K + k]);
++            svfloat16_t b2 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 2) * K + k]);
++            svfloat16_t b3 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 3) * K + k]);
++            svfloat16_t b4 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 4) * K + k]);
++            svfloat16_t b5 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 5) * K + k]);
++            svfloat16_t b6 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 6) * K + k]);
++            svfloat16_t b7 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 7) * K + k]);
++
++            acc0 = svmla_f16_m(pg_tail, acc0, a0, b0);
++            acc1 = svmla_f16_m(pg_tail, acc1, a0, b1);
++            acc2 = svmla_f16_m(pg_tail, acc2, a0, b2);
++            acc3 = svmla_f16_m(pg_tail, acc3, a0, b3);
++            acc4 = svmla_f16_m(pg_tail, acc4, a0, b4);
++            acc5 = svmla_f16_m(pg_tail, acc5, a0, b5);
++            acc6 = svmla_f16_m(pg_tail, acc6, a0, b6);
++            acc7 = svmla_f16_m(pg_tail, acc7, a0, b7);
++        }
++
++        C[(i + 0) * c_stride] = (float) svaddv_f16(pg, acc0);
++        C[(i + 1) * c_stride] = (float) svaddv_f16(pg, acc1);
++        C[(i + 2) * c_stride] = (float) svaddv_f16(pg, acc2);
++        C[(i + 3) * c_stride] = (float) svaddv_f16(pg, acc3);
++        C[(i + 4) * c_stride] = (float) svaddv_f16(pg, acc4);
++        C[(i + 5) * c_stride] = (float) svaddv_f16(pg, acc5);
++        C[(i + 6) * c_stride] = (float) svaddv_f16(pg, acc6);
++        C[(i + 7) * c_stride] = (float) svaddv_f16(pg, acc7);
+     }
+-#else
+-    for (int i = 0; i < n; ++i) {
+-        sumf += (ggml_float)(GGML_FP16_TO_FP32(x[i])*GGML_FP16_TO_FP32(y[i]));
++
++    // N tail: 4 outputs at once.
++    for (; i + 4 <= N; i += 4) {
++        svfloat16_t acc0 = svdup_f16(0.0f);
++        svfloat16_t acc1 = svdup_f16(0.0f);
++        svfloat16_t acc2 = svdup_f16(0.0f);
++        svfloat16_t acc3 = svdup_f16(0.0f);
++
++        size_t k = 0;
++
++        for (; k < K_rounded2; k += K_STEP2) {
++            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
++
++            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k]);
++            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k]);
++            svfloat16_t b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k]);
++            svfloat16_t b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k]);
++
++            acc0 = svmla_f16_m(pg, acc0, a0, b0);
++            acc1 = svmla_f16_m(pg, acc1, a0, b1);
++            acc2 = svmla_f16_m(pg, acc2, a0, b2);
++            acc3 = svmla_f16_m(pg, acc3, a0, b3);
++
++            svfloat16_t a1 = svld1_f16(pg, (const __fp16 *) &A[k + K_STEP]);
++
++            b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k + K_STEP]);
++            b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k + K_STEP]);
++            b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k + K_STEP]);
++            b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k + K_STEP]);
++
++            acc0 = svmla_f16_m(pg, acc0, a1, b0);
++            acc1 = svmla_f16_m(pg, acc1, a1, b1);
++            acc2 = svmla_f16_m(pg, acc2, a1, b2);
++            acc3 = svmla_f16_m(pg, acc3, a1, b3);
++        }
++
++        if (k < K_rounded1) {
++            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
++
++            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k]);
++            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k]);
++            svfloat16_t b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k]);
++            svfloat16_t b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k]);
++
++            acc0 = svmla_f16_m(pg, acc0, a0, b0);
++            acc1 = svmla_f16_m(pg, acc1, a0, b1);
++            acc2 = svmla_f16_m(pg, acc2, a0, b2);
++            acc3 = svmla_f16_m(pg, acc3, a0, b3);
++
++            k += K_STEP;
++        }
++
++        if (k < K) {
++            svbool_t pg_tail = svwhilelt_b16(k, K);
++
++            svfloat16_t a0 = svld1_f16(pg_tail, (const __fp16 *) &A[k]);
++
++            svfloat16_t b0 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 0) * K + k]);
++            svfloat16_t b1 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 1) * K + k]);
++            svfloat16_t b2 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 2) * K + k]);
++            svfloat16_t b3 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 3) * K + k]);
++
++            acc0 = svmla_f16_m(pg_tail, acc0, a0, b0);
++            acc1 = svmla_f16_m(pg_tail, acc1, a0, b1);
++            acc2 = svmla_f16_m(pg_tail, acc2, a0, b2);
++            acc3 = svmla_f16_m(pg_tail, acc3, a0, b3);
++        }
++
++        C[(i + 0) * c_stride] = (float) svaddv_f16(pg, acc0);
++        C[(i + 1) * c_stride] = (float) svaddv_f16(pg, acc1);
++        C[(i + 2) * c_stride] = (float) svaddv_f16(pg, acc2);
++        C[(i + 3) * c_stride] = (float) svaddv_f16(pg, acc3);
++    }
++
++    // Final N tail: 1 output at once, still SVE, no scalar fallback.
++    for (; i < N; i++) {
++        svfloat16_t acc = svdup_f16(0.0f);
++
++        size_t k = 0;
++
++        for (; k < K_rounded2; k += K_STEP2) {
++            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
++            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[i * K + k]);
++            acc = svmla_f16_m(pg, acc, a0, b0);
++
++            svfloat16_t a1 = svld1_f16(pg, (const __fp16 *) &A[k + K_STEP]);
++            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[i * K + k + K_STEP]);
++            acc = svmla_f16_m(pg, acc, a1, b1);
++        }
++
++        if (k < K_rounded1) {
++            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
++            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[i * K + k]);
++            acc = svmla_f16_m(pg, acc, a0, b0);
++            k += K_STEP;
++        }
++
++        if (k < K) {
++            svbool_t pg_tail = svwhilelt_b16(k, K);
++            svfloat16_t a0 = svld1_f16(pg_tail, (const __fp16 *) &A[k]);
++            svfloat16_t b0 = svld1_f16(pg_tail, (const __fp16 *) &B[i * K + k]);
++            acc = svmla_f16_m(pg_tail, acc, a0, b0);
++        }
++
++        C[i * c_stride] = (float) svaddv_f16(pg, acc);
+     }
++}
++
++
++void ggml_matmul_f16_4x4_kernel(size_t na, size_t nb, int dim,
++                   const void* GGML_RESTRICT a, const void* GGML_RESTRICT b,
++                   void* GGML_RESTRICT c, size_t c_column_bytes) {
++    const size_t M = na;
++    const size_t N = nb;
++    const size_t K = dim;
++    ggml_fp16_t* GGML_RESTRICT A = (ggml_fp16_t*)(a);
++    ggml_fp16_t* GGML_RESTRICT B = (ggml_fp16_t*)(b);
++    float32_t* GGML_RESTRICT C = (float32_t*)(c);
++    size_t c_stride = c_column_bytes / sizeof(float32_t);
++
++    const size_t K_rounded = K & ~((1 << 3) - 1);  // 处理K不是8的倍数的情况
++
++    // Fast path for N=1 (decode, M output channels × 1 token).
++    // Each K_STEP=8: load 1 B vector, inner loop over M rows with f16 fma.
++    // Reduces B loads by (M-1)/M compared to N_remainder path (1 SVE dot per row).
++    if (N == 1) {
++        for (size_t j = 0; j < M; j++) {
++            float16x8_t acc = vdupq_n_f16(0);
++
++            size_t k = 0;
++            for (; k < K_rounded; k += 8) {
++                float16x8_t b_v = vld1q_f16((const __fp16 *) &B[k]);
++                float16x8_t a_v = vld1q_f16((const __fp16 *) &A[j * K + k]);
++                acc = vfmaq_f16(acc, a_v, b_v);
++            }
++
++            if (k < K) {
++                svbool_t pg = svwhilelt_b16(k, K);
++                float16x8_t b_v = svget_neonq_f16(
++                    svld1_f16(pg, (const __fp16 *) &B[k]));
++                float16x8_t a_v = svget_neonq_f16(
++                    svld1_f16(pg, (const __fp16 *) &A[j * K + k]));
++                acc = vfmaq_f16(acc, a_v, b_v);
++            }
++
++            float32_t sum =
++                vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc))) +
++                vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc)));
++
++            C[j] = sum;
++        }
++
++        return;
++    }
++
++    size_t N_rounded = N & ~((1 << 2) - 1);
++    size_t M_rounded = M & ~((1 << 2) - 1);
++
++    for (size_t i = 0; i < N_rounded; i += 4) {
++        for (size_t j = 0; j < M_rounded; j += 4) {
++            float16x8_t acc00 = vdupq_n_f16(0);
++            float16x8_t acc01 = vdupq_n_f16(0);
++            float16x8_t acc02 = vdupq_n_f16(0);
++            float16x8_t acc03 = vdupq_n_f16(0);
++            float16x8_t acc10 = vdupq_n_f16(0);
++            float16x8_t acc11 = vdupq_n_f16(0);
++            float16x8_t acc12 = vdupq_n_f16(0);
++            float16x8_t acc13 = vdupq_n_f16(0);
++            float16x8_t acc20 = vdupq_n_f16(0);
++            float16x8_t acc21 = vdupq_n_f16(0);
++            float16x8_t acc22 = vdupq_n_f16(0);
++            float16x8_t acc23 = vdupq_n_f16(0);
++            float16x8_t acc30 = vdupq_n_f16(0);
++            float16x8_t acc31 = vdupq_n_f16(0);
++            float16x8_t acc32 = vdupq_n_f16(0);
++            float16x8_t acc33 = vdupq_n_f16(0);
++
++            for (size_t k = 0; k < K_rounded; k += 8) {
++                float16x8_t j0 = vld1q_f16((const __fp16 *)(&A[(j + 0) * K + k]));
++                float16x8_t j1 = vld1q_f16((const __fp16 *)(&A[(j + 1) * K + k]));
++                float16x8_t j2 = vld1q_f16((const __fp16 *)(&A[(j + 2) * K + k]));
++                float16x8_t j3 = vld1q_f16((const __fp16 *)(&A[(j + 3) * K + k]));
++                float16x8_t i0 = vld1q_f16((const __fp16 *)(&B[(i + 0) * K + k]));
++                float16x8_t i1 = vld1q_f16((const __fp16 *)(&B[(i + 1) * K + k]));
++                float16x8_t i2 = vld1q_f16((const __fp16 *)(&B[(i + 2) * K + k]));
++                float16x8_t i3 = vld1q_f16((const __fp16 *)(&B[(i + 3) * K + k]));
++
++                acc00 = vfmaq_f16(acc00, i0, j0);
++                acc01 = vfmaq_f16(acc01, i0, j1);
++                acc02 = vfmaq_f16(acc02, i0, j2);
++                acc03 = vfmaq_f16(acc03, i0, j3);
++                acc10 = vfmaq_f16(acc10, i1, j0);
++                acc11 = vfmaq_f16(acc11, i1, j1);
++                acc12 = vfmaq_f16(acc12, i1, j2);
++                acc13 = vfmaq_f16(acc13, i1, j3);
++                acc20 = vfmaq_f16(acc20, i2, j0);
++                acc21 = vfmaq_f16(acc21, i2, j1);
++                acc22 = vfmaq_f16(acc22, i2, j2);
++                acc23 = vfmaq_f16(acc23, i2, j3);
++                acc30 = vfmaq_f16(acc30, i3, j0);
++                acc31 = vfmaq_f16(acc31, i3, j1);
++                acc32 = vfmaq_f16(acc32, i3, j2);
++                acc33 = vfmaq_f16(acc33, i3, j3);
++            }
++
++            // 处理剩余的K元素(1-7个)
++            if (K_rounded < K) {
++                svbool_t pg = svwhilelt_b16(K_rounded, K);
++                float16x8_t j0 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&A[(j + 0) * K + K_rounded])));
++                float16x8_t j1 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&A[(j + 1) * K + K_rounded])));
++                float16x8_t j2 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&A[(j + 2) * K + K_rounded])));
++                float16x8_t j3 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&A[(j + 3) * K + K_rounded])));
++                float16x8_t i0 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[(i + 0) * K + K_rounded])));
++                float16x8_t i1 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[(i + 1) * K + K_rounded])));
++                float16x8_t i2 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[(i + 2) * K + K_rounded])));
++                float16x8_t i3 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[(i + 3) * K + K_rounded])));
++
++                acc00 = vfmaq_f16(acc00, i0, j0);
++                acc01 = vfmaq_f16(acc01, i0, j1);
++                acc02 = vfmaq_f16(acc02, i0, j2);
++                acc03 = vfmaq_f16(acc03, i0, j3);
++                acc10 = vfmaq_f16(acc10, i1, j0);
++                acc11 = vfmaq_f16(acc11, i1, j1);
++                acc12 = vfmaq_f16(acc12, i1, j2);
++                acc13 = vfmaq_f16(acc13, i1, j3);
++                acc20 = vfmaq_f16(acc20, i2, j0);
++                acc21 = vfmaq_f16(acc21, i2, j1);
++                acc22 = vfmaq_f16(acc22, i2, j2);
++                acc23 = vfmaq_f16(acc23, i2, j3);
++                acc30 = vfmaq_f16(acc30, i3, j0);
++                acc31 = vfmaq_f16(acc31, i3, j1);
++                acc32 = vfmaq_f16(acc32, i3, j2);
++                acc33 = vfmaq_f16(acc33, i3, j3);
++            }
++
++            // Horizontal reduction
++            float32_t r00 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc00))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc00)));
++            float32_t r01 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc01))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc01)));
++            float32_t r02 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc02))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc02)));
++            float32_t r03 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc03))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc03)));
++            float32_t r10 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc10))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc10)));
++            float32_t r11 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc11))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc11)));
++            float32_t r12 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc12))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc12)));
++            float32_t r13 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc13))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc13)));
++            float32_t r20 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc20))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc20)));
++            float32_t r21 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc21))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc21)));
++            float32_t r22 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc22))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc22)));
++            float32_t r23 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc23))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc23)));
++            float32_t r30 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc30))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc30)));
++            float32_t r31 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc31))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc31)));
++            float32_t r32 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc32))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc32)));
++            float32_t r33 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc33))) +
++                           vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc33)));
++
++            C[((i + 0) * c_stride) + (j + 0)] = r00;
++            C[((i + 0) * c_stride) + (j + 1)] = r01;
++            C[((i + 0) * c_stride) + (j + 2)] = r02;
++            C[((i + 0) * c_stride) + (j + 3)] = r03;
++            C[((i + 1) * c_stride) + (j + 0)] = r10;
++            C[((i + 1) * c_stride) + (j + 1)] = r11;
++            C[((i + 1) * c_stride) + (j + 2)] = r12;
++            C[((i + 1) * c_stride) + (j + 3)] = r13;
++            C[((i + 2) * c_stride) + (j + 0)] = r20;
++            C[((i + 2) * c_stride) + (j + 1)] = r21;
++            C[((i + 2) * c_stride) + (j + 2)] = r22;
++            C[((i + 2) * c_stride) + (j + 3)] = r23;
++            C[((i + 3) * c_stride) + (j + 0)] = r30;
++            C[((i + 3) * c_stride) + (j + 1)] = r31;
++            C[((i + 3) * c_stride) + (j + 2)] = r32;
++            C[((i + 3) * c_stride) + (j + 3)] = r33;
++        }
++    }
++
++    // Handle leftovers - M remainder (1-3 rows)
++    // Use batched NEON to avoid vec_dot_f16 overhead
++    size_t M_rem = M - M_rounded;
++    if (M_rem > 0) {
++        const size_t K_rounded = K & ~((1 << 3) - 1);
++        // Process N in batches
++        size_t i = 0;
++        for (; i + 4 <= N_rounded; i += 4) {
++            // Process M_rem rows x 4 B-rows
++            for (size_t j = M_rounded; j < M; j++) {
++                float16x8_t acc0 = vdupq_n_f16(0);
++                float16x8_t acc1 = vdupq_n_f16(0);
++                float16x8_t acc2 = vdupq_n_f16(0);
++                float16x8_t acc3 = vdupq_n_f16(0);
++                for (size_t k = 0; k < K_rounded; k += 8) {
++                    float16x8_t a_v = vld1q_f16((const __fp16 *)(&A[j * K + k]));
++                    float16x8_t b0 = vld1q_f16((const __fp16 *)(&B[(i + 0) * K + k]));
++                    float16x8_t b1 = vld1q_f16((const __fp16 *)(&B[(i + 1) * K + k]));
++                    float16x8_t b2 = vld1q_f16((const __fp16 *)(&B[(i + 2) * K + k]));
++                    float16x8_t b3 = vld1q_f16((const __fp16 *)(&B[(i + 3) * K + k]));
++                    acc0 = vfmaq_f16(acc0, a_v, b0);
++                    acc1 = vfmaq_f16(acc1, a_v, b1);
++                    acc2 = vfmaq_f16(acc2, a_v, b2);
++                    acc3 = vfmaq_f16(acc3, a_v, b3);
++                }
++                if (K_rounded < K) {
++                    svbool_t pg = svwhilelt_b16(K_rounded, K);
++                    float16x8_t a_v = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&A[j * K + K_rounded])));
++                    float16x8_t b0 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[(i + 0) * K + K_rounded])));
++                    float16x8_t b1 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[(i + 1) * K + K_rounded])));
++                    float16x8_t b2 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[(i + 2) * K + K_rounded])));
++                    float16x8_t b3 = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[(i + 3) * K + K_rounded])));
++                    acc0 = vfmaq_f16(acc0, a_v, b0);
++                    acc1 = vfmaq_f16(acc1, a_v, b1);
++                    acc2 = vfmaq_f16(acc2, a_v, b2);
++                    acc3 = vfmaq_f16(acc3, a_v, b3);
++                }
++                float32_t r0 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc0))) +
++                               vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc0)));
++                float32_t r1 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc1))) +
++                               vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc1)));
++                float32_t r2 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc2))) +
++                               vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc2)));
++                float32_t r3 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc3))) +
++                               vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc3)));
++                C[(i + 0) * c_stride + j] = r0;
++                C[(i + 1) * c_stride + j] = r1;
++                C[(i + 2) * c_stride + j] = r2;
++                C[(i + 3) * c_stride + j] = r3;
++            }
++        }
++        // Remaining N columns (0-3), handle each M_rem row individually
++        for (; i < N_rounded; i++) {
++            for (size_t j = M_rounded; j < M; j++) {
++                float16x8_t acc = vdupq_n_f16(0);
++                for (size_t k = 0; k < K_rounded; k += 8) {
++                    float16x8_t a_v = vld1q_f16((const __fp16 *)(&A[j * K + k]));
++                    float16x8_t b_v = vld1q_f16((const __fp16 *)(&B[i * K + k]));
++                    acc = vfmaq_f16(acc, a_v, b_v);
++                }
++                if (K_rounded < K) {
++                    svbool_t pg = svwhilelt_b16(K_rounded, K);
++                    float16x8_t a_v = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&A[j * K + K_rounded])));
++                    float16x8_t b_v = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[i * K + K_rounded])));
++                    acc = vfmaq_f16(acc, a_v, b_v);
++                }
++                float32_t r = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc))) +
++                              vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc)));
++                C[i * c_stride + j] = r;
++            }
++        }
++    }
++    // Handle N remainder (1-3 columns), for already-processed M rows
++    // Use SVE256 for the M-loop to process 16 fp16 per K step (vs NEON's 8)
++    for (size_t i = N_rounded; i < N; i++) {
++        // NEON fallback for non-SVE targets
++        for (size_t j = 0; j < M; j++) {
++            float16x8_t acc = vdupq_n_f16(0);
++            for (size_t k = 0; k < K_rounded; k += 8) {
++                float16x8_t a_v = vld1q_f16((const __fp16 *)(&A[j * K + k]));
++                float16x8_t b_v = vld1q_f16((const __fp16 *)(&B[i * K + k]));
++                acc = vfmaq_f16(acc, a_v, b_v);
++            }
++            if (K_rounded < K) {
++                svbool_t pg = svwhilelt_b16(K_rounded, K);
++                float16x8_t a_v = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&A[j * K + K_rounded])));
++                float16x8_t b_v = svget_neonq_f16(svld1_f16(pg, (const __fp16 *)(&B[i * K + K_rounded])));
++                acc = vfmaq_f16(acc, a_v, b_v);
++            }
++            float32_t r = vaddvq_f32(vcvt_f32_f16(vget_low_f16(acc))) +
++                          vaddvq_f32(vcvt_f32_f16(vget_high_f16(acc)));
++            C[i * c_stride + j] = r;
++        }
++    }
++}
++
++void
++matmul_outer_8x16_b_micro_packA_f32(size_t M,
++                                    size_t N,
++                                    size_t K,
++                                    const void* a,
++                                    size_t a_column_bytes,
++                                    const void* b,
++                                    size_t b_column_bytes,
++                                    void* GGML_RESTRICT c,
++                                    size_t c_column_bytes)
++{
++    assert(M % 16 == 0 && N % 8 == 0);
++    svbool_t pg_all = svptrue_b32();
++    float32_t* GGML_RESTRICT C = (float32_t*)(c);
++    const float32_t* GGML_RESTRICT B = (const float32_t*)(b);
++    size_t c_stride = c_column_bytes / sizeof(float32_t);
++    size_t b_stride = b_column_bytes / sizeof(float32_t);
++    size_t a_stride = a_column_bytes / sizeof(float32_t);
++    const float32_t* pa = NULL;
++    pa = (const float32_t*)(((const matmul_outer_pack_t*)a)->p);
++    for (size_t i = 0; i < N; i += 8) {
++        for (size_t j = 0; j < M; j += 16) {
++            svfloat32_t acc00;
++            svfloat32_t acc01;
++            svfloat32_t acc02;
++            svfloat32_t acc03;
++            svfloat32_t acc04;
++            svfloat32_t acc05;
++            svfloat32_t acc06;
++            svfloat32_t acc07;
++            svfloat32_t acc10;
++            svfloat32_t acc11;
++            svfloat32_t acc12;
++            svfloat32_t acc13;
++            svfloat32_t acc14;
++            svfloat32_t acc15;
++            svfloat32_t acc16;
++            svfloat32_t acc17;
++#define LOAD_C(a, b)                                                                                                   \
++    do {                                                                                                               \
++        (acc##a##b) = svld1_f32(pg_all, &C[((i + (b)) * c_stride) + (j + 8 * a)]);                                     \
++    } while (0)
++            LOAD_C(0, 0);
++            LOAD_C(0, 1);
++            LOAD_C(0, 2);
++            LOAD_C(0, 3);
++            LOAD_C(0, 4);
++            LOAD_C(0, 5);
++            LOAD_C(0, 6);
++            LOAD_C(0, 7);
++            LOAD_C(1, 0);
++            LOAD_C(1, 1);
++            LOAD_C(1, 2);
++            LOAD_C(1, 3);
++            LOAD_C(1, 4);
++            LOAD_C(1, 5);
++            LOAD_C(1, 6);
++            LOAD_C(1, 7);
++#undef LOAD_C
++            const float32_t* pa0 = &((const float32_t*)pa)[(j + 0 * 8) * a_stride];
++            const float32_t* pa1 = &((const float32_t*)pa)[(j + 1 * 8) * a_stride];
++            const float32_t* pb0 = &B[(i + 0) * b_stride];
++            const float32_t* pb1 = &B[(i + 1) * b_stride];
++            const float32_t* pb2 = &B[(i + 2) * b_stride];
++            const float32_t* pb3 = &B[(i + 3) * b_stride];
++            const float32_t* pb4 = &B[(i + 4) * b_stride];
++            const float32_t* pb5 = &B[(i + 5) * b_stride];
++            const float32_t* pb6 = &B[(i + 6) * b_stride];
++            const float32_t* pb7 = &B[(i + 7) * b_stride];
++            for (size_t k = 0; k < K; k += 4) {
++                svbool_t pg = k + 4 <= K ? pg_all : svwhilelt_b32(k, K);
++                svfloat32_t b0 = svld1rq_f32(pg, &pb0[k]);
++                svfloat32_t b1 = svld1rq_f32(pg, &pb1[k]);
++                svfloat32_t b2 = svld1rq_f32(pg, &pb2[k]);
++                svfloat32_t b3 = svld1rq_f32(pg, &pb3[k]);
++                svfloat32_t b4 = svld1rq_f32(pg, &pb4[k]);
++                svfloat32_t b5 = svld1rq_f32(pg, &pb5[k]);
++                svfloat32_t b6 = svld1rq_f32(pg, &pb6[k]);
++                svfloat32_t b7 = svld1rq_f32(pg, &pb7[k]);
++                svfloat32_t a0M1;
++                svfloat32_t a1M1;
++                svfloat32_t a0M2;
++                svfloat32_t a1M2;
++#define KERNEL8x2_IDX_I                                                                                                \
++    do {                                                                                                               \
++        a0M1 = svld1_f32(pg_all, &pa0[(k + 0) * 8]);                                                                   \
++        a1M1 = svld1_f32(pg_all, &pa1[(k + 0) * 8]);                                                                   \
++        a0M2 = svld1_f32(pg_all, &pa0[(k + 1) * 8]);                                                                   \
++        a1M2 = svld1_f32(pg_all, &pa1[(k + 1) * 8]);                                                                   \
++        acc00 = svmla_lane_f32(acc00, a0M1, b0, 0);                                                                    \
++        acc01 = svmla_lane_f32(acc01, a0M1, b1, 0);                                                                    \
++        acc02 = svmla_lane_f32(acc02, a0M1, b2, 0);                                                                    \
++        acc03 = svmla_lane_f32(acc03, a0M1, b3, 0);                                                                    \
++        acc04 = svmla_lane_f32(acc04, a0M1, b4, 0);                                                                    \
++        acc05 = svmla_lane_f32(acc05, a0M1, b5, 0);                                                                    \
++        acc06 = svmla_lane_f32(acc06, a0M1, b6, 0);                                                                    \
++        acc07 = svmla_lane_f32(acc07, a0M1, b7, 0);                                                                    \
++        acc10 = svmla_lane_f32(acc10, a1M1, b0, 0);                                                                    \
++        acc11 = svmla_lane_f32(acc11, a1M1, b1, 0);                                                                    \
++        acc12 = svmla_lane_f32(acc12, a1M1, b2, 0);                                                                    \
++        acc13 = svmla_lane_f32(acc13, a1M1, b3, 0);                                                                    \
++        acc14 = svmla_lane_f32(acc14, a1M1, b4, 0);                                                                    \
++        acc15 = svmla_lane_f32(acc15, a1M1, b5, 0);                                                                    \
++        acc16 = svmla_lane_f32(acc16, a1M1, b6, 0);                                                                    \
++        acc17 = svmla_lane_f32(acc17, a1M1, b7, 0);                                                                    \
++    } while (0)
++#define KERNEL8x2_IDX(idx, ml, mc)                                                                                     \
++    do {                                                                                                               \
++        a0M##ml = svld1_f32(pg_all, &pa0[(k + (idx + 1)) * 8]);                                                        \
++        acc00 = svmla_lane_f32(acc00, a0M##mc, b0, (idx));                                                             \
++        acc01 = svmla_lane_f32(acc01, a0M##mc, b1, (idx));                                                             \
++        acc02 = svmla_lane_f32(acc02, a0M##mc, b2, (idx));                                                             \
++        acc03 = svmla_lane_f32(acc03, a0M##mc, b3, (idx));                                                             \
++        acc04 = svmla_lane_f32(acc04, a0M##mc, b4, (idx));                                                             \
++        acc05 = svmla_lane_f32(acc05, a0M##mc, b5, (idx));                                                             \
++        acc06 = svmla_lane_f32(acc06, a0M##mc, b6, (idx));                                                             \
++        acc07 = svmla_lane_f32(acc07, a0M##mc, b7, (idx));                                                             \
++        a1M##ml = svld1_f32(pg_all, &pa1[(k + (idx + 1)) * 8]);                                                        \
++        acc10 = svmla_lane_f32(acc10, a1M##mc, b0, (idx));                                                             \
++        acc11 = svmla_lane_f32(acc11, a1M##mc, b1, (idx));                                                             \
++        acc12 = svmla_lane_f32(acc12, a1M##mc, b2, (idx));                                                             \
++        acc13 = svmla_lane_f32(acc13, a1M##mc, b3, (idx));                                                             \
++        acc14 = svmla_lane_f32(acc14, a1M##mc, b4, (idx));                                                             \
++        acc15 = svmla_lane_f32(acc15, a1M##mc, b5, (idx));                                                             \
++        acc16 = svmla_lane_f32(acc16, a1M##mc, b6, (idx));                                                             \
++        acc17 = svmla_lane_f32(acc17, a1M##mc, b7, (idx));                                                             \
++    } while (0)
++#define KERNEL8x2_IDX_E                                                                                                \
++    do {                                                                                                               \
++        acc00 = svmla_lane_f32(acc00, a0M2, b0, 3);                                                                    \
++        acc01 = svmla_lane_f32(acc01, a0M2, b1, 3);                                                                    \
++        acc02 = svmla_lane_f32(acc02, a0M2, b2, 3);                                                                    \
++        acc03 = svmla_lane_f32(acc03, a0M2, b3, 3);                                                                    \
++        acc04 = svmla_lane_f32(acc04, a0M2, b4, 3);                                                                    \
++        acc05 = svmla_lane_f32(acc05, a0M2, b5, 3);                                                                    \
++        acc06 = svmla_lane_f32(acc06, a0M2, b6, 3);                                                                    \
++        acc07 = svmla_lane_f32(acc07, a0M2, b7, 3);                                                                    \
++        acc10 = svmla_lane_f32(acc10, a1M2, b0, 3);                                                                    \
++        acc11 = svmla_lane_f32(acc11, a1M2, b1, 3);                                                                    \
++        acc12 = svmla_lane_f32(acc12, a1M2, b2, 3);                                                                    \
++        acc13 = svmla_lane_f32(acc13, a1M2, b3, 3);                                                                    \
++        acc14 = svmla_lane_f32(acc14, a1M2, b4, 3);                                                                    \
++        acc15 = svmla_lane_f32(acc15, a1M2, b5, 3);                                                                    \
++        acc16 = svmla_lane_f32(acc16, a1M2, b6, 3);                                                                    \
++        acc17 = svmla_lane_f32(acc17, a1M2, b7, 3);                                                                    \
++    } while (0)
++                KERNEL8x2_IDX_I;
++                KERNEL8x2_IDX(1, 1, 2);
++                KERNEL8x2_IDX(2, 2, 1);
++                KERNEL8x2_IDX_E;
++#undef KERNEL8x2_IDX_I
++#undef KERNEL8x2_IDX
++#undef KERNEL8x2_IDX_E
++            }
++#define SAVE_C(a, b)                                                                                                   \
++    do {                                                                                                               \
++        svst1_f32(pg_all, &C[((i + b) * c_stride) + (j + 8 * a)], (acc##a##b));                                        \
++    } while (0)
++            SAVE_C(0, 0);
++            SAVE_C(0, 1);
++            SAVE_C(0, 2);
++            SAVE_C(0, 3);
++            SAVE_C(0, 4);
++            SAVE_C(0, 5);
++            SAVE_C(0, 6);
++            SAVE_C(0, 7);
++            SAVE_C(1, 0);
++            SAVE_C(1, 1);
++            SAVE_C(1, 2);
++            SAVE_C(1, 3);
++            SAVE_C(1, 4);
++            SAVE_C(1, 5);
++            SAVE_C(1, 6);
++            SAVE_C(1, 7);
++#undef SAVE_C
++        }
++    }
++}
++// Kunpeng 950 experimental NEON 16x4 kernel.
++//
++// Drop-in replacement for:
++//   matmul_outer_8x16_b_micro_packA_f16()
++//
++// External interface is intentionally unchanged.
++// The caller may still pass N in multiples of 8; this kernel processes N in
++// internal tiles of 4, so no outer dispatch change is required for A/B testing.
++//
++// Tile:
++//   M = 16
++//   N = 4
++//
++// Register layout:
++//   v16-v19 : B row 0..3, M[0..7]
++//   v20-v23 : B row 0..3, M[8..15]
++//
++// Compared with the existing 16x8 kernel:
++//   accumulators: 16 -> 8
++//   live B regs : 8  -> 4
++//
++// This leaves substantially more register/scheduler headroom for Kunpeng 950.
++
++void
++matmul_outer_4x16_b_micro_packA_f16(size_t M,
++                                    size_t N,
++                                    size_t K,
++                                    const void* a,
++                                    size_t a_column_bytes,
++                                    const void* b,
++                                    size_t b_column_bytes,
++                                    void* GGML_RESTRICT c,
++                                    size_t c_column_bytes)
++{
++    GGML_UNUSED(a_column_bytes);
++
++    const matmul_outer_pack_t* pack_a =
++        (const matmul_outer_pack_t*) a;
++
++    assert(M % 16 == 0 && N % 4 == 0);
++
++    float32_t* GGML_RESTRICT C = (float32_t*) c;
++    const float16_t* GGML_RESTRICT B = (const float16_t*) b;
++
++    const size_t c_stride = c_column_bytes / sizeof(float32_t);
++    const size_t b_stride = b_column_bytes / sizeof(float16_t);
++    const size_t a_stride = pack_a->p_stride / sizeof(float16_t);
++
++    const size_t a_stride_bytes = a_stride * sizeof(float16_t);
++    const size_t b_stride_bytes = b_stride * sizeof(float16_t);
++    const size_t c_stride_bytes = c_stride * sizeof(float32_t);
++
++    asm volatile(
++        "mov x1, #0\n"                         // i = 0
++        "mov x10, %[B]\n"                      // pb0
++
++        // ================================================================
++        // N loop, 4 rows per tile
++        // ================================================================
++        "1:\n"
++        "add x11, x10, %[b_stride]\n"
++        "add x12, x11, %[b_stride]\n"
++        "add x13, x12, %[b_stride]\n"
++
++        "mov x2, #0\n"                         // j = 0
++        "mov x3, %[pa]\n"                      // pa0 base
++
++        // ================================================================
++        // M loop, 16 cols
++        // ================================================================
++        "2:\n"
++        "add x4, x3, %[a_stride_lsl3]\n"       // pa1 base
++
++        "movi v16.16b, #0\n"
++        "movi v17.16b, #0\n"
++        "movi v18.16b, #0\n"
++        "movi v19.16b, #0\n"
++        "movi v20.16b, #0\n"
++        "movi v21.16b, #0\n"
++        "movi v22.16b, #0\n"
++        "movi v23.16b, #0\n"
++
++        // Incrementing packed-A pointers.
++        "mov x8, x3\n"                         // A low-half ptr
++        "mov x9, x4\n"                         // A high-half ptr
++        "mov x7, #0\n"                         // B byte offset
++
++        // Number of complete 8-K blocks (16 bytes each).
++        "lsr x14, %[K2], #4\n"
++        "cbz x14, 6f\n"
++
++        // Preload first A pair.
++        "ldr q8, [x8]\n"
++        "ldr q9, [x9]\n"
++
++        // ================================================================
++        // Main loop: 8 FP16 K values / iteration
++        // ================================================================
++        "3:\n"
++        // Load B vectors for this 8-K block.
++        "ldr q0, [x10, x7]\n"
++        "ldr q1, [x11, x7]\n"
++        "ldr q2, [x12, x7]\n"
++        "ldr q3, [x13, x7]\n"
++
++        // lane 0, current A in v8/v9
++        "fmla v16.8h, v8.8h, v0.h[0]\n"
++        "fmla v17.8h, v8.8h, v1.h[0]\n"
++        "fmla v18.8h, v8.8h, v2.h[0]\n"
++        "fmla v19.8h, v8.8h, v3.h[0]\n"
++        "fmla v20.8h, v9.8h, v0.h[0]\n"
++        "fmla v21.8h, v9.8h, v1.h[0]\n"
++        "fmla v22.8h, v9.8h, v2.h[0]\n"
++        "fmla v23.8h, v9.8h, v3.h[0]\n"
++
++        // Preload lane 1 A while lane 0 FMLAs retire.
++        "ldr q10, [x8, #16]\n"
++        "ldr q11, [x9, #16]\n"
++
++        // lane 1
++        "fmla v16.8h, v10.8h, v0.h[1]\n"
++        "fmla v17.8h, v10.8h, v1.h[1]\n"
++        "fmla v18.8h, v10.8h, v2.h[1]\n"
++        "fmla v19.8h, v10.8h, v3.h[1]\n"
++        "fmla v20.8h, v11.8h, v0.h[1]\n"
++        "fmla v21.8h, v11.8h, v1.h[1]\n"
++        "fmla v22.8h, v11.8h, v2.h[1]\n"
++        "fmla v23.8h, v11.8h, v3.h[1]\n"
++
++        // lane 2
++        "ldr q8, [x8, #32]\n"
++        "ldr q9, [x9, #32]\n"
++        "fmla v16.8h, v8.8h, v0.h[2]\n"
++        "fmla v17.8h, v8.8h, v1.h[2]\n"
++        "fmla v18.8h, v8.8h, v2.h[2]\n"
++        "fmla v19.8h, v8.8h, v3.h[2]\n"
++        "fmla v20.8h, v9.8h, v0.h[2]\n"
++        "fmla v21.8h, v9.8h, v1.h[2]\n"
++        "fmla v22.8h, v9.8h, v2.h[2]\n"
++        "fmla v23.8h, v9.8h, v3.h[2]\n"
++
++        // lane 3
++        "ldr q10, [x8, #48]\n"
++        "ldr q11, [x9, #48]\n"
++        "fmla v16.8h, v10.8h, v0.h[3]\n"
++        "fmla v17.8h, v10.8h, v1.h[3]\n"
++        "fmla v18.8h, v10.8h, v2.h[3]\n"
++        "fmla v19.8h, v10.8h, v3.h[3]\n"
++        "fmla v20.8h, v11.8h, v0.h[3]\n"
++        "fmla v21.8h, v11.8h, v1.h[3]\n"
++        "fmla v22.8h, v11.8h, v2.h[3]\n"
++        "fmla v23.8h, v11.8h, v3.h[3]\n"
++
++        // lane 4
++        "ldr q8, [x8, #64]\n"
++        "ldr q9, [x9, #64]\n"
++        "fmla v16.8h, v8.8h, v0.h[4]\n"
++        "fmla v17.8h, v8.8h, v1.h[4]\n"
++        "fmla v18.8h, v8.8h, v2.h[4]\n"
++        "fmla v19.8h, v8.8h, v3.h[4]\n"
++        "fmla v20.8h, v9.8h, v0.h[4]\n"
++        "fmla v21.8h, v9.8h, v1.h[4]\n"
++        "fmla v22.8h, v9.8h, v2.h[4]\n"
++        "fmla v23.8h, v9.8h, v3.h[4]\n"
++
++        // lane 5
++        "ldr q10, [x8, #80]\n"
++        "ldr q11, [x9, #80]\n"
++        "fmla v16.8h, v10.8h, v0.h[5]\n"
++        "fmla v17.8h, v10.8h, v1.h[5]\n"
++        "fmla v18.8h, v10.8h, v2.h[5]\n"
++        "fmla v19.8h, v10.8h, v3.h[5]\n"
++        "fmla v20.8h, v11.8h, v0.h[5]\n"
++        "fmla v21.8h, v11.8h, v1.h[5]\n"
++        "fmla v22.8h, v11.8h, v2.h[5]\n"
++        "fmla v23.8h, v11.8h, v3.h[5]\n"
++
++        // lane 6
++        "ldr q8, [x8, #96]\n"
++        "ldr q9, [x9, #96]\n"
++        "fmla v16.8h, v8.8h, v0.h[6]\n"
++        "fmla v17.8h, v8.8h, v1.h[6]\n"
++        "fmla v18.8h, v8.8h, v2.h[6]\n"
++        "fmla v19.8h, v8.8h, v3.h[6]\n"
++        "fmla v20.8h, v9.8h, v0.h[6]\n"
++        "fmla v21.8h, v9.8h, v1.h[6]\n"
++        "fmla v22.8h, v9.8h, v2.h[6]\n"
++        "fmla v23.8h, v9.8h, v3.h[6]\n"
++
++        // lane 7
++        "ldr q10, [x8, #112]\n"
++        "ldr q11, [x9, #112]\n"
++        "fmla v16.8h, v10.8h, v0.h[7]\n"
++        "fmla v17.8h, v10.8h, v1.h[7]\n"
++        "fmla v18.8h, v10.8h, v2.h[7]\n"
++        "fmla v19.8h, v10.8h, v3.h[7]\n"
++        "fmla v20.8h, v11.8h, v0.h[7]\n"
++        "fmla v21.8h, v11.8h, v1.h[7]\n"
++        "fmla v22.8h, v11.8h, v2.h[7]\n"
++        "fmla v23.8h, v11.8h, v3.h[7]\n"
++
++        // Advance to next 8-K block.
++        "add x8, x8, #128\n"
++        "add x9, x9, #128\n"
++        "add x7, x7, #16\n"
++
++        "subs x14, x14, #1\n"
++        "b.eq 6f\n"
++
++        // Preload next block's lane 0 A so next iteration starts ready.
++        "ldr q8, [x8]\n"
++        "ldr q9, [x9]\n"
++        "b 3b\n"
++
++        // ================================================================
++        // Scalar tail: if K is not multiple of 8.
++        // x7 is current B byte offset.
++        // x8/x9 already point to matching packed-A offset.
++        // ================================================================
++        "6:\n"
++        "cmp x7, %[K2]\n"
++        "b.hs 7f\n"
++
++        "5:\n"
++        "ldr h0, [x10, x7]\n"
++        "ldr h1, [x11, x7]\n"
++        "ldr h2, [x12, x7]\n"
++        "ldr h3, [x13, x7]\n"
++
++        "ldr q8, [x8]\n"
++        "ldr q9, [x9]\n"
++
++        "fmla v16.8h, v8.8h, v0.h[0]\n"
++        "fmla v17.8h, v8.8h, v1.h[0]\n"
++        "fmla v18.8h, v8.8h, v2.h[0]\n"
++        "fmla v19.8h, v8.8h, v3.h[0]\n"
++        "fmla v20.8h, v9.8h, v0.h[0]\n"
++        "fmla v21.8h, v9.8h, v1.h[0]\n"
++        "fmla v22.8h, v9.8h, v2.h[0]\n"
++        "fmla v23.8h, v9.8h, v3.h[0]\n"
++
++        "add x7, x7, #2\n"
++        "add x8, x8, #16\n"
++        "add x9, x9, #16\n"
++        "cmp x7, %[K2]\n"
++        "b.lo 5b\n"
++
++        // ================================================================
++        // Store 4 x 16 FP32
++        // ================================================================
++        "7:\n"
++        "lsl x5, x2, #2\n"
++        "add x5, x5, %[C]\n"
++
++#define STORE_16X4_ROW(LO, HI)                                      \
++        "fcvtl v0.4s, v" #LO ".4h\n"                               \
++        "fcvtl2 v1.4s, v" #LO ".8h\n"                              \
++        "stp q0, q1, [x5, #0]\n"                                   \
++        "fcvtl v0.4s, v" #HI ".4h\n"                               \
++        "fcvtl2 v1.4s, v" #HI ".8h\n"                              \
++        "stp q0, q1, [x5, #32]\n"
++
++        STORE_16X4_ROW(16, 20)
++        "add x5, x5, %[c_stride]\n"
++
++        STORE_16X4_ROW(17, 21)
++        "add x5, x5, %[c_stride]\n"
++
++        STORE_16X4_ROW(18, 22)
++        "add x5, x5, %[c_stride]\n"
++
++        STORE_16X4_ROW(19, 23)
++
++#undef STORE_16X4_ROW
++
++        // Next M tile.
++        "add x3, x3, %[a_stride_lsl4]\n"
++        "add x2, x2, #16\n"
++        "cmp x2, %[M]\n"
++        "b.cc 2b\n"
++
++        // Next N tile, 4 rows.
++        "add %[C], %[C], %[c_stride_lsl2]\n"
++        "add x10, x10, %[b_stride_lsl2]\n"
++
++        "add x1, x1, #4\n"
++        "cmp x1, %[N]\n"
++        "b.cc 1b\n"
++
++        : [C] "+r"(C)
++        : [N] "r"(N),
++          [M] "r"(M),
++          [K2] "r"(K * 2),
++          [B] "r"(B),
++          [pa] "r"(pack_a->p),
++          [a_stride_lsl3] "r"(a_stride_bytes * 8),
++          [a_stride_lsl4] "r"(a_stride_bytes * 16),
++          [b_stride] "r"(b_stride_bytes),
++          [b_stride_lsl2] "r"(b_stride_bytes * 4),
++          [c_stride] "r"(c_stride_bytes),
++          [c_stride_lsl2] "r"(c_stride_bytes * 4)
++        : "memory", "cc",
++          "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++          "x10", "x11", "x12", "x13", "x14",
++          "v0", "v1", "v2", "v3",
++          "v8", "v9", "v10", "v11",
++          "v16", "v17", "v18", "v19",
++          "v20", "v21", "v22", "v23"
++    );
++}
++// Kunpeng 950 software-pipelined variant:
++// - Uses v16-v31 for all 16 accumulators, so only v8-v11 are callee-saved.
++//   This removes the save/restore of d12-d15 from the generated prologue/epilogue.
++// - Contains no software PRFM. Verify the rebuilt disassembly also contains none.
++// - Removes the 10 inner-loop software prefetch instructions.
++// - Delays the second packed-A half load and overlaps it with first-half FMLA.
++// - Splits B loads into 4+4 groups and interleaves them with FMLA.
++// - Reuses packed-A addresses for the second 8K sub-block.
++// - Uses a precomputed countdown for the 32-byte main K loop, eliminating
++//   the per-iteration add/cmp/exit-branch sequence.
++// - Keeps arithmetic order, tile shape, packing format and tail handling.
++void
++matmul_outer_8x16_b_micro_packA_f16(size_t M,
++                                    size_t N,
++                                    size_t K,
++                                    const void* a,
++                                    size_t a_column_bytes,
++                                    const void* b,
++                                    size_t b_column_bytes,
++                                    void* GGML_RESTRICT c,
++                                    size_t c_column_bytes)
++{
++    GGML_UNUSED(a_column_bytes);
++    const matmul_outer_pack_t* pack_a = (const matmul_outer_pack_t*)a;
++    assert(M % 16 == 0 && N % 8 == 0);
++    float32_t* GGML_RESTRICT C = (float32_t*)(c);
++    const float16_t* GGML_RESTRICT B = (const float16_t*)(b);
++    size_t c_stride = c_column_bytes / sizeof(float32_t);
++    size_t b_stride = b_column_bytes / sizeof(float16_t);
++    size_t a_stride = pack_a->p_stride / sizeof(float16_t);
++
++    const size_t a_stride_bytes = a_stride * sizeof(float16_t);
++    const size_t b_stride_bytes = b_stride * sizeof(float16_t);
++    const size_t c_stride_bytes = c_stride * sizeof(float32_t);
++
++    asm volatile(
++            "mov x1, #0\n"                     // i = 0
++            "mov x10, %[B]\n"                  // pb0 = &B[0]
++
++            "1:\n"                             // for i..N, step=8
++            "add x11, x10, %[b_stride]\n"      // pb1 = pb0 + b_stride
++            "add x12, x11, %[b_stride]\n"
++            "add x13, x12, %[b_stride]\n"
++            "add x14, x13, %[b_stride]\n"
++            "add x15, x14, %[b_stride]\n"
++            "add x16, x15, %[b_stride]\n"
++            "add x17, x16, %[b_stride]\n"
++
++            "mov x2, #0\n"                     // j = 0
++            "mov x3, %[pa]\n"                  // pa0 = pa
++
++            "2:\n"                             // for j..M, step=16
++            "add x4, x3, %[a_stride_lsl3]\n"   // pa1 = pa0 + 8 * a_stride_bytes
++
++            "movi v16.16b, #0\n"
++            "movi v17.16b, #0\n"
++            "movi v18.16b, #0\n"
++            "movi v19.16b, #0\n"
++            "movi v20.16b, #0\n"
++            "movi v21.16b, #0\n"
++            "movi v22.16b, #0\n"
++            "movi v23.16b, #0\n"
++            "movi v24.16b, #0\n"
++            "movi v25.16b, #0\n"
++            "movi v26.16b, #0\n"
++            "movi v27.16b, #0\n"
++            "movi v28.16b, #0\n"
++            "movi v29.16b, #0\n"
++            "movi v30.16b, #0\n"
++            "movi v31.16b, #0\n"
++
++            "mov x7, #0\n"                     // k2 = byte offset into B
++            "lsr x18, %[K2], #5\n"            // number of complete 32-byte K chunks
++            "cbz x18, 7f\n"
++
++            // ==== main unroll2 loop: exactly floor(K2 / 32) iterations ====
++            "3:\n"
++
++            // Inner-loop PRFM removed permanently to reduce frontend/LSU pressure.
++
++#define KERNEL_8x8_M_D(idx, rl1, rl2, rc1, rc2)                    \
++            "ldr q" #rl1 ", [x8, #((" #idx " + 1) * 16)]\n"      \
++            "ldr q" #rl2 ", [x9, #((" #idx " + 1) * 16)]\n"      \
++            /* Interleave low/high M accumulators to spread rename/issue pressure. */ \
++            "fmla v16.8h, v" #rc1 ".8h, v0.h[" #idx "]\n"       \
++            "fmla v24.8h, v" #rc2 ".8h, v0.h[" #idx "]\n"       \
++            "fmla v17.8h, v" #rc1 ".8h, v1.h[" #idx "]\n"       \
++            "fmla v25.8h, v" #rc2 ".8h, v1.h[" #idx "]\n"       \
++            "fmla v18.8h, v" #rc1 ".8h, v2.h[" #idx "]\n"       \
++            "fmla v26.8h, v" #rc2 ".8h, v2.h[" #idx "]\n"       \
++            "fmla v19.8h, v" #rc1 ".8h, v3.h[" #idx "]\n"       \
++            "fmla v27.8h, v" #rc2 ".8h, v3.h[" #idx "]\n"       \
++            "fmla v20.8h, v" #rc1 ".8h, v4.h[" #idx "]\n"       \
++            "fmla v28.8h, v" #rc2 ".8h, v4.h[" #idx "]\n"       \
++            "fmla v21.8h, v" #rc1 ".8h, v5.h[" #idx "]\n"       \
++            "fmla v29.8h, v" #rc2 ".8h, v5.h[" #idx "]\n"       \
++            "fmla v22.8h, v" #rc1 ".8h, v6.h[" #idx "]\n"       \
++            "fmla v30.8h, v" #rc2 ".8h, v6.h[" #idx "]\n"       \
++            "fmla v23.8h, v" #rc1 ".8h, v7.h[" #idx "]\n"       \
++            "fmla v31.8h, v" #rc2 ".8h, v7.h[" #idx "]\n"
++
++#define KERNEL_BODY_8K_D()                                          \
++            /* Load the first M-half only; delay the second M-half load. */ \
++            "ldp q8, q10, [x8, #(0 * 16)]\n"                        \
++            "ldr q0, [x10, x6]\n"                                   \
++            "ldr q1, [x11, x6]\n"                                   \
++            "ldr q2, [x12, x6]\n"                                   \
++            "ldr q3, [x13, x6]\n"                                   \
++            "fmla v16.8h, v8.8h, v0.h[0]\n"                        \
++            "fmla v17.8h, v8.8h, v1.h[0]\n"                        \
++            "fmla v18.8h, v8.8h, v2.h[0]\n"                        \
++            "fmla v19.8h, v8.8h, v3.h[0]\n"                        \
++            /* q9/q11 now overlap with first-half FMLA retirement. */ \
++            "ldp q9, q11, [x9, #(0 * 16)]\n"                        \
++            "fmla v24.8h, v9.8h, v0.h[0]\n"                        \
++            "fmla v25.8h, v9.8h, v1.h[0]\n"                        \
++            "fmla v26.8h, v9.8h, v2.h[0]\n"                        \
++            "fmla v27.8h, v9.8h, v3.h[0]\n"                        \
++            "ldr q4, [x14, x6]\n"                                   \
++            "ldr q5, [x15, x6]\n"                                   \
++            "ldr q6, [x16, x6]\n"                                   \
++            "ldr q7, [x17, x6]\n"                                   \
++            "fmla v20.8h, v8.8h, v4.h[0]\n"                        \
++            "fmla v21.8h, v8.8h, v5.h[0]\n"                        \
++            "fmla v22.8h, v8.8h, v6.h[0]\n"                        \
++            "fmla v23.8h, v8.8h, v7.h[0]\n"                        \
++            "fmla v28.8h, v9.8h, v4.h[0]\n"                        \
++            "fmla v29.8h, v9.8h, v5.h[0]\n"                        \
++            "fmla v30.8h, v9.8h, v6.h[0]\n"                        \
++            "fmla v31.8h, v9.8h, v7.h[0]\n"                        \
++            KERNEL_8x8_M_D(1,  8,  9, 10, 11)                       \
++            KERNEL_8x8_M_D(2, 10, 11,  8,  9)                       \
++            KERNEL_8x8_M_D(3,  8,  9, 10, 11)                       \
++            KERNEL_8x8_M_D(4, 10, 11,  8,  9)                       \
++            KERNEL_8x8_M_D(5,  8,  9, 10, 11)                       \
++            KERNEL_8x8_M_D(6, 10, 11,  8,  9)                       \
++            "fmla v16.8h, v10.8h, v0.h[7]\n"                       \
++            "fmla v17.8h, v10.8h, v1.h[7]\n"                       \
++            "fmla v18.8h, v10.8h, v2.h[7]\n"                       \
++            "fmla v19.8h, v10.8h, v3.h[7]\n"                       \
++            "fmla v20.8h, v10.8h, v4.h[7]\n"                       \
++            "fmla v21.8h, v10.8h, v5.h[7]\n"                       \
++            "fmla v22.8h, v10.8h, v6.h[7]\n"                       \
++            "fmla v23.8h, v10.8h, v7.h[7]\n"                       \
++            "fmla v24.8h, v11.8h, v0.h[7]\n"                       \
++            "fmla v25.8h, v11.8h, v1.h[7]\n"                       \
++            "fmla v26.8h, v11.8h, v2.h[7]\n"                       \
++            "fmla v27.8h, v11.8h, v3.h[7]\n"                       \
++            "fmla v28.8h, v11.8h, v4.h[7]\n"                       \
++            "fmla v29.8h, v11.8h, v5.h[7]\n"                       \
++            "fmla v30.8h, v11.8h, v6.h[7]\n"                       \
++            "fmla v31.8h, v11.8h, v7.h[7]\n"
++
++            // First 8K sub-block: calculate packed-A addresses once.
++            "lsl x6, x7, #3\n"
++            "add x8, x3, x6\n"
++            "add x9, x4, x6\n"
++            "mov x6, x7\n"
++            KERNEL_BODY_8K_D()
++
++            // Second 8K sub-block: fixed increments replace add/lsl/add.
++            "add x8, x8, #128\n"
++            "add x9, x9, #128\n"
++            "add x6, x7, #16\n"
++            KERNEL_BODY_8K_D()
++
++#undef KERNEL_BODY_8K_D
++#undef KERNEL_8x8_M_D
++
++            "add x7, x7, #32\n"
++            "subs x18, x18, #1\n"
++            "b.ne 3b\n"
++
++            // ==== remainder full block loop: for (; k2 + 16 <= K2; k2 += 16) ====
++            "7:\n"
++            "add x6, x7, #16\n"
++            "cmp x6, %[K2]\n"
++            "b.hi 4f\n"
++
++            "lsl x6, x7, #3\n"
++            "add x8, x3, x6\n"
++            "add x9, x4, x6\n"
++            "ldp q8, q10, [x8, #(0 * 16)]\n"
++            "ldr q0, [x10, x7]\n"
++            "ldr q1, [x11, x7]\n"
++            "ldr q2, [x12, x7]\n"
++            "ldr q3, [x13, x7]\n"
++            "fmla v16.8h, v8.8h, v0.h[0]\n"
++            "fmla v17.8h, v8.8h, v1.h[0]\n"
++            "fmla v18.8h, v8.8h, v2.h[0]\n"
++            "fmla v19.8h, v8.8h, v3.h[0]\n"
++            "ldp q9, q11, [x9, #(0 * 16)]\n"
++            "fmla v24.8h, v9.8h, v0.h[0]\n"
++            "fmla v25.8h, v9.8h, v1.h[0]\n"
++            "fmla v26.8h, v9.8h, v2.h[0]\n"
++            "fmla v27.8h, v9.8h, v3.h[0]\n"
++            "ldr q4, [x14, x7]\n"
++            "ldr q5, [x15, x7]\n"
++            "ldr q6, [x16, x7]\n"
++            "ldr q7, [x17, x7]\n"
++            "fmla v20.8h, v8.8h, v4.h[0]\n"
++            "fmla v21.8h, v8.8h, v5.h[0]\n"
++            "fmla v22.8h, v8.8h, v6.h[0]\n"
++            "fmla v23.8h, v8.8h, v7.h[0]\n"
++            "fmla v28.8h, v9.8h, v4.h[0]\n"
++            "fmla v29.8h, v9.8h, v5.h[0]\n"
++            "fmla v30.8h, v9.8h, v6.h[0]\n"
++            "fmla v31.8h, v9.8h, v7.h[0]\n"
++
++#define KERNEL_8x8_M_D_REM(idx, rl1, rl2, rc1, rc2)                    \
++            "ldr q" #rl1 ", [x8, #((" #idx " + 1) * 16)]\n"      \
++            "ldr q" #rl2 ", [x9, #((" #idx " + 1) * 16)]\n"      \
++            /* Interleave low/high M accumulators to spread rename/issue pressure. */ \
++            "fmla v16.8h, v" #rc1 ".8h, v0.h[" #idx "]\n"       \
++            "fmla v24.8h, v" #rc2 ".8h, v0.h[" #idx "]\n"       \
++            "fmla v17.8h, v" #rc1 ".8h, v1.h[" #idx "]\n"       \
++            "fmla v25.8h, v" #rc2 ".8h, v1.h[" #idx "]\n"       \
++            "fmla v18.8h, v" #rc1 ".8h, v2.h[" #idx "]\n"       \
++            "fmla v26.8h, v" #rc2 ".8h, v2.h[" #idx "]\n"       \
++            "fmla v19.8h, v" #rc1 ".8h, v3.h[" #idx "]\n"       \
++            "fmla v27.8h, v" #rc2 ".8h, v3.h[" #idx "]\n"       \
++            "fmla v20.8h, v" #rc1 ".8h, v4.h[" #idx "]\n"       \
++            "fmla v28.8h, v" #rc2 ".8h, v4.h[" #idx "]\n"       \
++            "fmla v21.8h, v" #rc1 ".8h, v5.h[" #idx "]\n"       \
++            "fmla v29.8h, v" #rc2 ".8h, v5.h[" #idx "]\n"       \
++            "fmla v22.8h, v" #rc1 ".8h, v6.h[" #idx "]\n"       \
++            "fmla v30.8h, v" #rc2 ".8h, v6.h[" #idx "]\n"       \
++            "fmla v23.8h, v" #rc1 ".8h, v7.h[" #idx "]\n"       \
++            "fmla v31.8h, v" #rc2 ".8h, v7.h[" #idx "]\n"
++
++            KERNEL_8x8_M_D_REM(1,  8,  9, 10, 11)
++            KERNEL_8x8_M_D_REM(2, 10, 11,  8,  9)
++            KERNEL_8x8_M_D_REM(3,  8,  9, 10, 11)
++            KERNEL_8x8_M_D_REM(4, 10, 11,  8,  9)
++            KERNEL_8x8_M_D_REM(5,  8,  9, 10, 11)
++            KERNEL_8x8_M_D_REM(6, 10, 11,  8,  9)
++#undef KERNEL_8x8_M_D_REM
++
++            "fmla v16.8h, v10.8h, v0.h[7]\n"
++            "fmla v24.8h, v11.8h, v0.h[7]\n"
++            "fmla v17.8h, v10.8h, v1.h[7]\n"
++            "fmla v25.8h, v11.8h, v1.h[7]\n"
++            "fmla v18.8h, v10.8h, v2.h[7]\n"
++            "fmla v26.8h, v11.8h, v2.h[7]\n"
++            "fmla v19.8h, v10.8h, v3.h[7]\n"
++            "fmla v27.8h, v11.8h, v3.h[7]\n"
++            "fmla v20.8h, v10.8h, v4.h[7]\n"
++            "fmla v28.8h, v11.8h, v4.h[7]\n"
++            "fmla v21.8h, v10.8h, v5.h[7]\n"
++            "fmla v29.8h, v11.8h, v5.h[7]\n"
++            "fmla v22.8h, v10.8h, v6.h[7]\n"
++            "fmla v30.8h, v11.8h, v6.h[7]\n"
++            "fmla v23.8h, v10.8h, v7.h[7]\n"
++            "fmla v31.8h, v11.8h, v7.h[7]\n"
++            "add x7, x7, #16\n"
++            "b 7b\n"
++
++            "4:\n"                             // end full-block K loops
++
++            // ==== tail: for (; k2 < K2; k2 += 2), one fp16 at a time ====
++            "5:\n"
++            "cmp x7, %[K2]\n"
++            "b.hs 6f\n"
++
++            "lsl x8, x7, #3\n"
++            "ldr h0, [x10, x7]\n"
++            "ldr h1, [x11, x7]\n"
++            "ldr h2, [x12, x7]\n"
++            "ldr h3, [x13, x7]\n"
++            "ldr h4, [x14, x7]\n"
++            "ldr h5, [x15, x7]\n"
++            "ldr h6, [x16, x7]\n"
++            "ldr h7, [x17, x7]\n"
++            "ldr q8, [x3, x8]\n"
++            "ldr q9, [x4, x8]\n"
++            "fmla v16.8h, v8.8h, v0.h[0]\n"
++            "fmla v17.8h, v8.8h, v1.h[0]\n"
++            "fmla v18.8h, v8.8h, v2.h[0]\n"
++            "fmla v19.8h, v8.8h, v3.h[0]\n"
++            "fmla v20.8h, v8.8h, v4.h[0]\n"
++            "fmla v21.8h, v8.8h, v5.h[0]\n"
++            "fmla v22.8h, v8.8h, v6.h[0]\n"
++            "fmla v23.8h, v8.8h, v7.h[0]\n"
++            "fmla v24.8h, v9.8h, v0.h[0]\n"
++            "fmla v25.8h, v9.8h, v1.h[0]\n"
++            "fmla v26.8h, v9.8h, v2.h[0]\n"
++            "fmla v27.8h, v9.8h, v3.h[0]\n"
++            "fmla v28.8h, v9.8h, v4.h[0]\n"
++            "fmla v29.8h, v9.8h, v5.h[0]\n"
++            "fmla v30.8h, v9.8h, v6.h[0]\n"
++            "fmla v31.8h, v9.8h, v7.h[0]\n"
++
++            "add x7, x7, #2\n"
++            "b 5b\n"
++
++            "6:\n"                             // end K loop
++
++            "add x3, x3, %[a_stride_lsl4]\n"   // pa0 += 16 * a_stride_bytes
++
++            "lsl x5, x2, #2\n"
++            "add x5, x5, %[C]\n"               // ptrC = C + j
++
++            "fcvtl v0.4s, v16.4h\n  fcvtl2 v1.4s, v16.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v24.4h\n  fcvtl2 v1.4s, v24.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v17.4h\n  fcvtl2 v1.4s, v17.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v25.4h\n  fcvtl2 v1.4s, v25.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v18.4h\n  fcvtl2 v1.4s, v18.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v26.4h\n  fcvtl2 v1.4s, v26.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v19.4h\n  fcvtl2 v1.4s, v19.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v27.4h\n  fcvtl2 v1.4s, v27.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v20.4h\n  fcvtl2 v1.4s, v20.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v28.4h\n  fcvtl2 v1.4s, v28.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v21.4h\n  fcvtl2 v1.4s, v21.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v29.4h\n  fcvtl2 v1.4s, v29.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v22.4h\n  fcvtl2 v1.4s, v22.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v30.4h\n  fcvtl2 v1.4s, v30.8h\n  stp q0, q1, [x5, #32]\n"
++            "add x5, x5, %[c_stride]\n"
++            "fcvtl v0.4s, v23.4h\n  fcvtl2 v1.4s, v23.8h\n  stp q0, q1, [x5, #0]\n"
++            "fcvtl v0.4s, v31.4h\n  fcvtl2 v1.4s, v31.8h\n  stp q0, q1, [x5, #32]\n"
++
++            "add x2, x2, #16\n"
++            "cmp x2, %[M]\n"
++            "b.cc 2b\n"
++
++            "add %[C], %[C], %[c_stride_lsl3]\n" // C += 8 * c_stride_bytes
++            "add x10, x10, %[b_stride_lsl3]\n"  // pb0 += 8 * b_stride_bytes
++
++            "add x1, x1, #8\n"
++            "cmp x1, %[N]\n"
++            "b.cc 1b\n"
++        : [C] "+r"(C)
++        : [N] "r"(N),
++          [M] "r"(M),
++          [K2] "r"(K * 2),
++          [B] "r"(B),
++          [pa] "r"(pack_a->p),
++          [a_stride_lsl3] "r"(a_stride_bytes * 8),
++          [a_stride_lsl4] "r"(a_stride_bytes * 16),
++          [b_stride] "r"(b_stride_bytes),
++          [b_stride_lsl3] "r"(b_stride_bytes * 8),
++          [c_stride] "r"(c_stride_bytes),
++          [c_stride_lsl3] "r"(c_stride_bytes * 8)
++        : "memory", "cc",
++          "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++          "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18",
++          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
++          "v8", "v9", "v10", "v11",
++          "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
++          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31"
++    );
++}
++void matmul_outer_packA_destroy(matmul_outer_pack_t *spack) {
++    if (!spack) {
++        return;
++    }
++    if (spack->p) {
++        free(spack->p);
++    }
++    free(spack);
++}
++
++void
++matmul_outer_packA(size_t nr,
++                  int dim,
++                  const void* GGML_RESTRICT X_,
++                  size_t el_bits,
++                  size_t column_bytes,
++                  matmul_outer_pack_t** out)
++{
++    const uint8_t* GGML_RESTRICT X = (const uint8_t*)X_;
++    const size_t K = dim;
++    size_t el_bytes = el_bits / 8;
++    size_t K_bytes = K * el_bytes;
++    size_t stride_8b = column_bytes / sizeof(uint8_t);
++    assert(X != NULL);
++    matmul_outer_pack_t* pack = NULL;
++    size_t sz_p = MAX(sizeof(*pack->p) * nr * K_bytes, 64);
++    if (*out != NULL && (*out)->sz_p == sz_p && (*out)->nr == nr && (*out)->dim == dim) {
++        pack = *out;
++    } else {
++        if (*out) {
++            matmul_outer_packA_destroy(*out);
++            *out = NULL;
++        }
++        pack = (matmul_outer_pack_t*)malloc(sizeof(matmul_outer_pack_t));
++        pack->p = (uint8_t*)aligned_alloc(64, sz_p);
++        pack->p_stride = K_bytes;
++        pack->sz_p = sz_p;
++        pack->nr = nr;
++        pack->dim = dim;
++    }
++    // NOTE: Assume that we are using SVE256
++    for (size_t i = 0; i < nr;) {
++        if (el_bits == 32) {
++#if 0
++            svuint32_t ldst_indices = svindex_u32(0, stride_8b / sizeof(uint32_t));
++            svbool_t pg = svwhilelt_b32(i, MIN(nr, i + 4));
++            svbool_t pg_vl4 = svptrue_pat_b32(SV_VL4);
++            for (size_t ki = 0; ki < K; ki++) {
++                svuint32_t svb = svld1_gather_u32index_u32(pg, (const uint32_t*)&X[(i + 0) * stride_8b + ki * sizeof(uint32_t)], ldst_indices);
++                svst1_u32(pg_vl4, (uint32_t*)&pack->p[i * pack->p_stride + ki * sizeof(uint32_t) * 4], svb);
++            }
++#else
++            const size_t vl_32b = svcntw();
++            for (size_t ki = 0; ki < K; ki += vl_32b) {
++                svuint32_t row0, row1, row2, row3;
++                svbool_t pg = svwhilelt_b32(ki, K);
++                const static uint32_t zero_x[8] = { 0 };
++                const uint32_t* ptr_rows[4];
++                for (size_t t = 0; t < 4; t++) {
++                    ptr_rows[t] =
++                        i + t < nr ? (const uint32_t*)&X[(i + t) * stride_8b + ki * sizeof(uint32_t)] : zero_x;
++                }
++                row0 = svld1_u32(pg, ptr_rows[0]);
++                row1 = svld1_u32(pg, ptr_rows[1]);
++                row2 = svld1_u32(pg, ptr_rows[2]);
++                row3 = svld1_u32(pg, ptr_rows[3]);
++                svst4_u32(pg,
++                            (uint32_t*)&pack->p[i * pack->p_stride + ki * sizeof(uint32_t) * 4],
++                            svcreate4_u32(row0, row1, row2, row3));
++            }
+ #endif
++            i += 4;
++        } else if(el_bits == 16) {
++            if (K < svcnth()) {
++                svuint32_t ldst_indices = svindex_u32(0, stride_8b / sizeof(uint16_t));
++                svbool_t pg = svwhilelt_b32(i, MIN(nr, i + 8));
++                svbool_t pg_vl8 = svptrue_pat_b16(SV_VL8);
++                for (size_t ki = 0; ki < K; ki++) {
++                    svuint32_t svbl = svld1uh_gather_u32index_u32(pg, (const uint16_t*)&X[(i + 0) * stride_8b + ki * sizeof(uint16_t)], ldst_indices);
++                    svuint16_t svb = svuzp1_u16(svreinterpret_u16_u32(svbl), svdup_u16(0));
++                    svst1_u16(pg_vl8, (uint16_t*)&pack->p[i * pack->p_stride + ki * sizeof(uint16_t) * 8], svb);
++                }
++            } else {
++                const size_t vl_16b = svcnth();
++                for (size_t ki = 0; ki < K; ki += vl_16b) {
++                    svuint16_t row0, row1, row2, row3;
++                    svuint16_t row4, row5, row6, row7;
++                    svbool_t pg = svwhilelt_b16(ki, K);
++                    const static uint16_t zero_x[16] = { 0 };
++                    const uint16_t* ptr_rows[8];
++                    for (size_t t = 0; t < 8; t++) {
++                        ptr_rows[t] = i + t < nr ? (const uint16_t*)&X[(i + t) * stride_8b + ki * sizeof(uint16_t)] : zero_x;
++                    }
++                    row0 = svld1_u16(pg, ptr_rows[0]);
++                    row1 = svld1_u16(pg, ptr_rows[1]);
++                    row2 = svld1_u16(pg, ptr_rows[2]);
++                    row3 = svld1_u16(pg, ptr_rows[3]);
++                    row4 = svld1_u16(pg, ptr_rows[4]);
++                    row5 = svld1_u16(pg, ptr_rows[5]);
++                    row6 = svld1_u16(pg, ptr_rows[6]);
++                    row7 = svld1_u16(pg, ptr_rows[7]);
++                    svuint16_t zip1_04 = svzip1_u16(row0, row4);
++                    svuint16_t zip1_15 = svzip1_u16(row1, row5);
++                    svuint16_t zip1_26 = svzip1_u16(row2, row6);
++                    svuint16_t zip1_37 = svzip1_u16(row3, row7);
++                    svst4_u16(pg,
++                            (uint16_t*)&pack
++                                ->p[i * pack->p_stride + ki * sizeof(uint16_t) * 8 + 0 * 8 * 8 * sizeof(uint16_t)],
++                            svcreate4_u16(zip1_04, zip1_15, zip1_26, zip1_37));
++                    svuint16_t zip2_04 = svzip2_u16(row0, row4);
++                    svuint16_t zip2_15 = svzip2_u16(row1, row5);
++                    svuint16_t zip2_26 = svzip2_u16(row2, row6);
++                    svuint16_t zip2_37 = svzip2_u16(row3, row7);
++                    svst4_u16(pg,
++                            (uint16_t*)&pack
++                                ->p[i * pack->p_stride + ki * sizeof(uint16_t) * 8 + 1 * 8 * 8 * sizeof(uint16_t)],
++                            svcreate4_u16(zip2_04, zip2_15, zip2_26, zip2_37));
++                }
++            }
++            i += 8;
++        }
++    }
++    *out = pack;
++}
+ 
+-    *s = sumf;
++void
++matmul_outer_packA_b(size_t na,
++                     size_t nb,
++                     int dim,
++                     size_t el_bits,
++                     const void* GGML_RESTRICT a,
++                     const void* GGML_RESTRICT b,
++                     void* GGML_RESTRICT c,
++                     size_t c_column_bytes,
++                     matmul_outer_packA_func func)
++{
++    assert(func);
++    const size_t M = na;
++    const size_t N = nb;
++    const size_t K = dim;
++    const size_t el_bytes = el_bits / 8;
++    const uint8_t* GGML_RESTRICT A = (const uint8_t*)(a);
++    const uint8_t* GGML_RESTRICT B = (const uint8_t*)(b);
++    float32_t* GGML_RESTRICT C = (float32_t*)(c);
++    size_t c_stride = c_column_bytes / sizeof(float32_t);
++    for (size_t i = 0; i < N; i++) {
++        for (size_t j = 0; j < M; j++) {
++            C[i * c_stride + j] = 0.0f;
++        }
++    }
++    if (M == 0 || N == 0) return;
++    size_t M_BLK = g_chunk_size_outer_packA / 4;
++    size_t N_BLK = g_chunk_size_outer_packA / 1;
++    size_t K_BLK = 4096;
++    size_t a_column_bytes = K * el_bytes;
++    size_t b_column_bytes = K * el_bytes;
++    matmul_outer_pack_t* pack_a = NULL;
++    for (size_t ki = 0; ki < K; ki += K_BLK) {
++        size_t k = MIN(K_BLK, K - ki);
++        size_t kb = ki * el_bits / 8;
++        for (size_t m = 0; m < M; m += M_BLK) {
++            size_t na = MIN(M_BLK, M - m);
++            matmul_outer_packA(na, k, &A[m * a_column_bytes + kb], el_bits, a_column_bytes, &pack_a);
++            for (size_t n = 0; n < N; n += N_BLK) {
++                size_t nb = MIN(N_BLK, N - n);
++                func(na, nb, k, pack_a, pack_a->p_stride, &B[n * b_column_bytes + kb], b_column_bytes, &C[n * c_stride + m], c_column_bytes);
++            }
++        }
++    }
++    matmul_outer_packA_destroy(pack_a);
+ }
+ 
+ void ggml_vec_silu_f32(const int n, float * y, const float * x) {
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 09dbade2..c4bb0f23 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -43,6 +43,107 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
+ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc);
+ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
+ 
++void ggml_matmul_f32_4x4_kernel(size_t na, size_t nb, int dim, const void* GGML_RESTRICT a, const void* GGML_RESTRICT b, void* GGML_RESTRICT c, size_t c_column_bytes);
++void ggml_matmul_f16_4x4_kernel(size_t na, size_t nb, int dim, const void* GGML_RESTRICT a, const void* GGML_RESTRICT b, void* GGML_RESTRICT c, size_t c_column_bytes);
++
++typedef void (*matmul_outer_pack_func)(size_t M,
++                                       size_t N,
++                                       size_t K,
++                                       const matmul_outer_pack_t* pack_a,
++                                       const matmul_outer_pack_t* pack_b,
++                                       void* GGML_RESTRICT c,
++                                       size_t c_column_bytes);
++
++static size_t g_chunk_size_outer_packA = 128;
++
++typedef void (*matmul_outer_packA_func)(size_t M,
++                                        size_t N,
++                                        size_t K,
++                                        const void* a,
++                                        size_t a_column_bytes,
++                                        const void* b,
++                                        size_t b_column_bytes,
++                                        void* GGML_RESTRICT c,
++                                        size_t c_column_bytes);
++
++void
++matmul_outer_packA_b(size_t na,
++                       size_t nb,
++                       int dim,
++                       size_t el_bits,
++                       const void* GGML_RESTRICT a,
++                       const void* GGML_RESTRICT b,
++                       void* GGML_RESTRICT c,
++                       size_t c_column_bytes,
++                       matmul_outer_packA_func func);
++
++void
++matmul_outer_8x16_b_micro_packA_f32(size_t M,
++                                    size_t N,
++                                    size_t K,
++                                    const void* a,
++                                    size_t a_column_bytes,
++                                    const void* b,
++                                    size_t b_column_bytes,
++                                    void* GGML_RESTRICT c,
++                                    size_t c_column_bytes);
++
++void
++matmul_outer_8x16_b_micro_packA_f16(size_t M,
++                                    size_t N,
++                                    size_t K,
++                                    const void* a,
++                                    size_t a_column_bytes,
++                                    const void* b,
++                                    size_t b_column_bytes,
++                                    void* GGML_RESTRICT c,
++                                    size_t c_column_bytes);
++void
++matmul_outer_4x16_b_micro_packA_f16(size_t M,
++                                    size_t N,
++                                    size_t K,
++                                    const void* a,
++                                    size_t a_column_bytes,
++                                    const void* b,
++                                    size_t b_column_bytes,
++                                    void* GGML_RESTRICT c,
++                                    size_t c_column_bytes);
++
++void
++matmul_outer_8x16_b_micro_packA_f16_neon(size_t M,
++                                           size_t N,
++                                           size_t K,
++                                           const void* a,
++                                           size_t a_column_bytes,
++                                           const void* b,
++                                           size_t b_column_bytes,
++                                           void* GGML_RESTRICT c,
++                                           size_t c_column_bytes);
++
++static inline void
++matmul_outer_packA_b_g_b32(size_t na,
++                           size_t nb,
++                           int dim,
++                           const void* GGML_RESTRICT a,
++                           const void* GGML_RESTRICT b,
++                           void* GGML_RESTRICT c,
++                           size_t c_column_bytes)
++{
++    matmul_outer_packA_b(na, nb, dim, 32, a, b, c, c_column_bytes, matmul_outer_8x16_b_micro_packA_f32);
++}
++
++static inline void
++matmul_outer_packA_b_g_b16(size_t na,
++                           size_t nb,
++                           int dim,
++                           const void* GGML_RESTRICT a,
++                           const void* GGML_RESTRICT b,
++                           void* GGML_RESTRICT c,
++                           size_t c_column_bytes)
++{
++    matmul_outer_packA_b(na, nb, dim, 16, a, b, c, c_column_bytes, matmul_outer_8x16_b_micro_packA_f16);
++}
++
+ void ggml_vec_silu_f32(const int n, float * y, const float * x);
+ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max);
+ ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, float max);
+@@ -376,11 +477,18 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
+         }
+         // leftovers
+         // maximum number of leftover elements will be less that ggml_f32_epr. Apply predicated svmad on available elements only
+-        if (np < n) {
+-            svbool_t pg = svwhilelt_b32(np, n);
+-            ay1 = svld1_f32(pg, y + np);
++        // if (np < n) {
++        //     svbool_t pg = svwhilelt_b32(np, n);
++        //     ay1 = svld1_f32(pg, y + np);
++        //     ay1 = svmul_f32_m(pg, ay1, vx);
++        //     svst1_f32(pg, y + np, ay1);
++        // }
++        // leftover count can be up to 2*ggml_f32_epr - 1; loop in ggml_f32_epr chunks
++        for (int i = np; i < n; i += ggml_f32_epr) {
++            svbool_t pg = svwhilelt_b32(i, n);
++            ay1 = svld1_f32(pg, y + i);
+             ay1 = svmul_f32_m(pg, ay1, vx);
+-            svst1_f32(pg, y + np, ay1);
++            svst1_f32(pg, y + i, ay1);
+         }
+     #else
+         const int np = (n & ~(GGML_F32_STEP - 1));
+-- 
+2.43.0
+
