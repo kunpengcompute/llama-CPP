@@ -25,6 +25,14 @@ taskset -c $(seq -s, 128 2 158) env GGML_FUSED_CPP_SDPA=1 GGML_TOTAL_THREADS=16 
 ### 精度验证
 
  精度验证前务必将基线使用`baseline-buf-fixed.patch`修复。
+ 
+ 步骤：
+ 1. checkout到官方llama.cpp的commit 3ac67535c86
+ 2. git apply baseline-buf-fixed.patch
+ 3. 编译，用这个版本来验证精度
+ 
+ 
+ 精度结果参考：
 
 | Task                    | F16-baseline-fixed | F16-opt    | Q80-opt    | F16精度损失 | Q80精度损失 |
 | ----------------------- | ------------------ | ---------- | ---------- | ----------- | ----------- |
