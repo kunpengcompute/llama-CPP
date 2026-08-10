@@ -32,7 +32,25 @@ taskset -c $(seq -s, 128 2 158) env GGML_FUSED_CPP_SDPA=1 GGML_TOTAL_THREADS=16 
  3. 编译，用这个版本来验证精度
  
  
- 精度结果参考：
+ CMTEB精度结果参考：
+ 
+ ```shell
+ # --servers后面以<server_name>=<server url>设置llama server，空格分离多个server
+ # --server-workers数量等于上面的server数，测试几个server就用几个worker
+ # --cmteb-root改成你的C-MTEB数据集路径
+ # 有哪个Task的分数是NaN，可以再单独跑一下该Task
+ 
+python eval_llamacpp_cmteb.py \
+--servers baseline=http://141.61.21.62:8080 opt=http://141.61.21.62:7080 \
+--server-workers 2 \
+--task-names   TNews IFlyTek MultilingualSentiment JDReview OnlineShopping Waimai     CLSClusteringS2S.v2 CLSClusteringP2P.v2 ThuNewsClusteringS2S.v2 ThuNewsClusteringP2P.v2     Ocnli Cmnli     T2Reranking MMarcoReranking CMedQAv1-reranking CMedQAv2-reranking     ATEC BQ LCQMC PAWSX STSB AFQMC QBQTC   \
+--cmteb-root /home/l30061571/models/datasets/C-MTEB \
+--batch-size 1 \
+--max-chars 500 \
+--skip-bad-embedding \
+--output-dir ./f16-all \
+--continue-on-error
+ ```
 
 | Task                    | F16-baseline-fixed | F16-opt    | Q80-opt    | F16精度损失 | Q80精度损失 |
 | ----------------------- | ------------------ | ---------- | ---------- | ----------- | ----------- |
