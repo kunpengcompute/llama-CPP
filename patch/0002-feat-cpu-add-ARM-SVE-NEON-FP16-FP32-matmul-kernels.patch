@@ -1,7 +1,7 @@
 From c7a54ec041837af34d9c7149758dbcb75e90d4fb Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:18:57 +0800
-Subject: [PATCH 02/10] feat(cpu): add ARM SVE/NEON FP16 & FP32 matmul kernels
+Subject: [PATCH 02/11] feat(cpu): add ARM SVE/NEON FP16 & FP32 matmul kernels
 
 - ggml-cpu.h: expose matmul type-trait hook (matmul_f, matmul_outer_pack_t,
   is_matmul_valid) used by the new mul_mat dispatch path

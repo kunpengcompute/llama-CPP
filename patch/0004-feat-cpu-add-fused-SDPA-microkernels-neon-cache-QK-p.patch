@@ -1,7 +1,7 @@
 From 926098d4216c1d9015fb0e080c4360ac750f1630 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:19:24 +0800
-Subject: [PATCH 04/10] feat(cpu): add fused SDPA microkernels (neon cache + QK
+Subject: [PATCH 04/11] feat(cpu): add fused SDPA microkernels (neon cache + QK
  pack)
 
 - sdpa_microkernels/neon_cache_config.h: cache config for the fused SDPA path

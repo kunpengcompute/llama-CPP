@@ -1,7 +1,7 @@
 From 8329c767ab27b4957ab2aaf9053e72b96dae80e2 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:19:42 +0800
-Subject: [PATCH 05/10] feat(cpu): add fused SDPA flash2 L3KV implementation
+Subject: [PATCH 05/11] feat(cpu): add fused SDPA flash2 L3KV implementation
 
 - sdpa_common.h: shared types/consts for the fused fp32_packqkv SDPA path
 - sdpa_flash2_neon_l3kv_impl.h: flash2-style NEON kernel with a packed

@@ -1,7 +1,7 @@
 From dab2accef4273dd6155871bfe9c68cf7eef405d5 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:20:13 +0800
-Subject: [PATCH 08/10] feat(cpu): wire optimized matmul & fused SDPA kernels
+Subject: [PATCH 08/11] feat(cpu): wire optimized matmul & fused SDPA kernels
  into ggml dispatch
 
 - type_traits_cpu: enable is_matmul_valid and hook matmul for F16 / Q8_0

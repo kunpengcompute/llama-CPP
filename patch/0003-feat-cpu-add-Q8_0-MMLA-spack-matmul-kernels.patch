@@ -1,7 +1,7 @@
 From 76b5a66ffea772ed1613bf452b876879cb8fc8a9 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:19:07 +0800
-Subject: [PATCH 03/10] feat(cpu): add Q8_0 MMLA spack matmul kernels
+Subject: [PATCH 03/11] feat(cpu): add Q8_0 MMLA spack matmul kernels
 
 - ggml-cpu-quants.h: declare matmul_q8_0_mmla_spack pack/run API,
   4x4/8x8 micro-kernels (+ neon variants) and masked kernel

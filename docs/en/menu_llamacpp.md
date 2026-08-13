@@ -2,3 +2,5 @@
 - [Feature Introduction](./feature_introduction.md)
 - [Release Notes](./release_notes.md)
 - [User Guide](./user_guide.md)
+- [Unit Test Guide](./unit_test_guide.md)
+- [Technical Report (Chinese)](../zh/technical_report.md)

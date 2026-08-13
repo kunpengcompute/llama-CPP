@@ -1,7 +1,7 @@
 From fec0f0f0ab62363aa452e30c132f75541907ad60 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:20:24 +0800
-Subject: [PATCH 09/10] build: add compile.sh helper for ARM builds
+Subject: [PATCH 09/11] build: add compile.sh helper for ARM builds
 
 - build-fused-sdpa profile: -O3 -funroll-loops with armv8.6-a+dotprod+i8mm+sve
 - default profile: -O3 RelWithDebInfo; builds ggml-cpu, llama-embedding,

@@ -1,7 +1,7 @@
 From 4c89e10bcbc455c85714fb0b2b87da8d42b20c8c Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:19:52 +0800
-Subject: [PATCH 06/10] feat(cpu): add fused SDPA fp32 packqkv front-end
+Subject: [PATCH 06/11] feat(cpu): add fused SDPA fp32 packqkv front-end
 
 - fp32_packqkv_sdpa.h/.cpp: public entry points for the fused SDPA kernel
   (fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp family),
