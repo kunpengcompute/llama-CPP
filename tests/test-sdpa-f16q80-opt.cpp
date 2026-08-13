@@ -1,0 +1,299 @@
+// Unit test for the fused SDPA operator (GGML_OP_FUSED_CPP_SDPA_EXT) and the
+// F16 / F32 / Q8_0 GEMM matmul path (ggml_mul_mat) using synthetic (mock) inputs.
+//
+// No model file is required. We feed in-memory generated q/k/v/mask tensors
+// through a real ggml CPU graph and compare the fused SDPA output against a
+// host-side reference attention computation, and the matmul outputs (F32/F16/
+// Q8_0) against a host-side naive matmul. Each case passes when the normalized
+// relative error (NMSE) is below a threshold.
+//
+// The fused SDPA operator is only compiled into ggml-cpu on ARM, so this test
+// is gated on the aarch64/arm host in tests/CMakeLists.txt.
+
+#include "ggml.h"
+#include "ggml-cpu.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include <string>
+
+#undef NDEBUG
+#include <assert.h>
+#include <math.h>
+
+#if defined(_MSC_VER)
+#pragma warning(disable: 4244 4267) // possible loss of data
+#endif
+
+static const char * RESULT_STR[] = { "ok", "FAILED" };
+
+// normalized mean squared error = mse(a, b) / mse(a, 0)
+static double nmse(const float * a, const float * b, size_t n) {
+    double mse_a_b = 0.0;
+    double mse_a_0 = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        mse_a_b += (double)(a[i] - b[i]) * (double)(a[i] - b[i]);
+        mse_a_0 += (double) a[i] * (double) a[i];
+    }
+    return mse_a_b / (mse_a_0 + 1e-12);
+}
+
+// sine-based deterministic pseudo-random fill (reproducible, no RNG state)
+static void fill_float(float * p, size_t n, float lo, float hi, unsigned seed) {
+    for (size_t i = 0; i < n; i++) {
+        const double t = 0.5 + 0.5 * sin((double)(seed + i) * 0.0137);
+        p[i] = lo + (float)t * (hi - lo);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SDPA host reference
+//
+// Layout matches what ggml_fused_cpp_sdpa_ext expects (post-permute):
+//   q : [D, L, H, B]
+//   k : [D, S, H, B]
+//   v : [DV, S, H, B]
+//   mask : [S, L, Hm, Bm]  (broadcast over H/B), values are applied additively
+//   out : [DV, H, L, B]
+//
+// out[b][h][l][:] = V^T * softmax( (K^T * q) * scale + mask )
+// ---------------------------------------------------------------------------
+static void reference_sdpa(float * out,
+                           const float * q, const float * k, const float * v,
+                           const float * mask, // may be null
+                           int64_t B, int64_t H, int64_t L, int64_t S,
+                           int64_t D, int64_t DV, float scale) {
+    // Host buffers are memcpy'd raw into ggml tensors with ne:
+    //   q : [D, L, H, B],  k : [D, S, H, B],  v : [DV, S, H, B]
+    //   mask : [S, L],     out : [DV, H, L, B]
+    // so indexing below matches ggml's contiguous (innermost = ne[0]) layout.
+    std::vector<float> scores(S);
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t h = 0; h < H; h++) {
+            for (int64_t l = 0; l < L; l++) {
+                float smax = -INFINITY;
+                for (int64_t s = 0; s < S; s++) {
+                    float acc = 0.0f;
+                    for (int64_t d = 0; d < D; d++) {
+                        const float qv = q[(b*(H*L*D) + h*(L*D) + l*D) + d];
+                        const float kv = k[(b*(H*S*D) + h*(S*D) + s*D) + d];
+                        acc += qv * kv;
+                    }
+                    float sc = scale * acc;
+                    if (mask != nullptr) {
+                        sc += mask[l*S + s];
+                    }
+                    scores[s] = sc;
+                    if (sc > smax) smax = sc;
+                }
+                // softmax over S
+                double denom = 0.0;
+                for (int64_t s = 0; s < S; s++) denom += exp((double)scores[s] - smax);
+                for (int64_t d2 = 0; d2 < DV; d2++) {
+                    double acc = 0.0;
+                    for (int64_t s = 0; s < S; s++) {
+                        const double p = exp((double)scores[s] - smax) / denom;
+                        acc += p * v[(b*(H*S*DV) + h*(S*DV) + s*DV) + d2];
+                    }
+                    out[(b*(DV*H*L) + h*DV + l*(DV*H)) + d2] = (float) acc;
+                }
+            }
+        }
+    }
+}
+
+static std::vector<float> run_fused_sdpa(const float * q, const float * k,
+        const float * v, const float * mask,
+        int64_t B, int64_t H, int64_t L, int64_t S, int64_t D, int64_t DV,
+        float scale, int n_threads) {
+    const size_t qnb = (size_t) D * L * H * B * sizeof(float);
+    const size_t knb = (size_t) D * S * H * B * sizeof(float);
+    const size_t vnb = (size_t) DV * S * H * B * sizeof(float);
+    const size_t mnb = mask != nullptr ? (size_t) S * L * sizeof(float) : 0;
+    const size_t onb = (size_t) DV * H * L * B * sizeof(float);
+    const size_t mem = ggml_tensor_overhead() * 16 + ggml_graph_overhead()
+                     + qnb + knb + vnb + mnb + onb + 64 * 1024;
+    ggml_init_params params = { mem, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+
+    ggml_tensor * qq = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, L, H, B);
+    ggml_tensor * kk = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, S, H, B);
+    ggml_tensor * vv = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DV, S, H, B);
+    ggml_tensor * mm = nullptr;
+    if (mask != nullptr) {
+        mm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, L);
+    }
+
+    memcpy(qq->data, q, ggml_nbytes(qq));
+    memcpy(kk->data, k, ggml_nbytes(kk));
+    memcpy(vv->data, v, ggml_nbytes(vv));
+    if (mm != nullptr) {
+        memcpy(mm->data, mask, ggml_nbytes(mm));
+    }
+
+    ggml_tensor * out = ggml_fused_cpp_sdpa_ext(ctx, qq, kk, vv, mm, scale);
+    GGML_ASSERT(out != nullptr);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    GGML_ASSERT(ggml_graph_compute_with_ctx(ctx, gf, n_threads) == GGML_STATUS_SUCCESS);
+
+    const size_t n_out = ggml_nelements(out);
+    std::vector<float> res(n_out);
+    memcpy(res.data(), out->data, n_out * sizeof(float));
+
+    ggml_free(ctx);
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// GEMM host reference: C = A * B, A[M,K], B[K,N].
+// ggml_mul_mat output tensor is ne=[M, N] so its raw (contiguous) layout is
+// column-major: c[i + j*M]. The op computes out[i][j] = sum_k w[i][k] * act[j][k],
+// i.e. the activation is read transposed (N x K). a (wf) is M x K row-major,
+// b (aval) is read as N x K row-major.
+static void reference_matmul(float * c, const float * a, const float * b,
+                             size_t M, size_t N, size_t K) {
+    for (size_t i = 0; i < M; i++) {
+        for (size_t j = 0; j < N; j++) {
+            double acc = 0.0;
+            for (size_t k = 0; k < K; k++) {
+                acc += (double) a[i*K + k] * (double) b[j*K + k];
+            }
+            c[i + j*M] = (float) acc;
+        }
+    }
+}
+
+// run ggml_mul_mat(weights, activations) -> out.
+// weights: [K, M] (ggml mul_mat treats src0 as [K, M] column-major internally)
+// activations: [K, N], out: [M, N]
+static std::vector<float> run_mul_mat(ggml_type wtype,
+        const float * wf32, size_t M, size_t K,
+        const float * aval, size_t N,
+        int n_threads) {
+    const size_t mem_base = ggml_tensor_overhead() * 16 + ggml_graph_overhead();
+    // allow headroom for quantized weights + activation buffers
+    const size_t mem = mem_base + ggml_row_size(wtype, M) * K + M * K * sizeof(float);
+    ggml_init_params params = { mem, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+
+    ggml_tensor * w  = ggml_new_tensor_2d(ctx, wtype, K, M);
+    ggml_tensor * act = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+
+    size_t w_nbytes = ggml_row_size(wtype, ggml_nelements(w));
+    std::vector<uint8_t> wq(w_nbytes);
+    if (wtype == GGML_TYPE_F32) {
+        memcpy(wq.data(), wf32, w_nbytes);
+    } else if (wtype == GGML_TYPE_F16) {
+        for (size_t i = 0; i < (size_t) ggml_nelements(w); i++) {
+            ((ggml_fp16_t *) wq.data())[i] = ggml_fp32_to_fp16(wf32[i]);
+        }
+    } else if (ggml_is_quantized(wtype)) {
+        GGML_ASSERT(ggml_nelements(w) % ggml_blck_size(wtype) == 0);
+        size_t nb = ggml_nelements(w) / ggml_blck_size(wtype);
+        ggml_quantize_chunk(wtype, wf32, wq.data(), 0, nb, ggml_blck_size(wtype), nullptr);
+    } else {
+        GGML_ABORT("unsupported weight type in run_mul_mat");
+    }
+    memcpy(w->data, wq.data(), w_nbytes);
+    memcpy(act->data, aval, ggml_nbytes(act));
+
+    ggml_tensor * out = ggml_mul_mat(ctx, w, act);
+    GGML_ASSERT(out != nullptr);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    GGML_ASSERT(ggml_graph_compute_with_ctx(ctx, gf, n_threads) == GGML_STATUS_SUCCESS);
+
+    const size_t n_out = ggml_nelements(out);
+    std::vector<float> res(n_out);
+    memcpy(res.data(), out->data, n_out * sizeof(float));
+
+    ggml_free(ctx);
+    return res;
+}
+
+#define SDPA_CASE(b,h,l,s,d,dv,scale,use_mask)                                    \
+    do {                                                                          \
+        const int64_t B = b, H = h, L = l, S = s, D = d, DV = dv;                 \
+        std::vector<float> q(B*H*L*D), k(B*H*S*D), v(B*H*S*DV);                  \
+        std::vector<float> mask;                                                  \
+        fill_float(q.data(), q.size(), -1, 1, 101);                               \
+        fill_float(k.data(), k.size(), -1, 1, 202);                               \
+        fill_float(v.data(), v.size(), -1, 1, 303);                               \
+        if (use_mask) { mask.resize(S*L); fill_float(mask.data(), mask.size(), -2, 0, 404); } \
+        const float * mp = use_mask ? mask.data() : nullptr;                      \
+        std::vector<float> ref(B*H*L*DV);                                         \
+        reference_sdpa(ref.data(), q.data(), k.data(), v.data(), mp,              \
+                       B, H, L, S, D, DV, scale);                                 \
+        std::vector<float> got = run_fused_sdpa(q.data(), k.data(), v.data(),     \
+                       mp, B, H, L, S, D, DV, scale, 1);                          \
+        const double err = nmse(ref.data(), got.data(), ref.size());              \
+        const bool ok = err < 1e-4;                                               \
+        printf("  SDPA B=%lld H=%lld L=%lld S=%lld D=%lld DV=%lld mask=%d "       \
+               "NMSE=%.3e %s\n", (long long)B, (long long)H, (long long)L,        \
+               (long long)S, (long long)D, (long long)DV, use_mask, err,          \
+               RESULT_STR[!ok]);                                                  \
+        failures += !ok;                                                          \
+    } while (0)
+
+#define GEMM_CASE(wt, m, n, k)                                                    \
+    do {                                                                          \
+        const size_t M = m, N = n, K = k;                                         \
+        std::vector<float> wf(M*K), aval(K*N), ref(M*N);                          \
+        fill_float(wf.data(), wf.size(), -1, 1, 505);                             \
+        fill_float(aval.data(), aval.size(), -1, 1, 606);                         \
+        reference_matmul(ref.data(), wf.data(), aval.data(), M, N, K);            \
+        std::vector<float> got = run_mul_mat(wt, wf.data(), M, K,                  \
+                                             aval.data(), N, 1);                   \
+        const double err = nmse(ref.data(), got.data(), ref.size());              \
+        /* fp16 accumulation precision degrades with K; q8_0/f32 stay tight */    \
+        const double thresh = (wt == GGML_TYPE_F16) ? 5e-3 : 1e-4;                \
+        const bool ok = err < thresh;                                             \
+        printf("  GEMM %-5s M=%zu N=%zu K=%zu NMSE=%.3e thr=%.1e %s\n",           \
+               ggml_type_name(wt), M, N, K, err, thresh, RESULT_STR[!ok]);        \
+        failures += !ok;                                                          \
+    } while (0)
+
+int main(void) {
+    int failures = 0;
+
+    printf("=== fused SDPA (GGML_OP_FUSED_CPP_SDPA_EXT) ===\n");
+    SDPA_CASE(1, 2, 8, 8, 32, 32, 0.125f, 0);
+    SDPA_CASE(1, 2, 8, 8, 32, 32, 0.125f, 1);
+    SDPA_CASE(2, 4, 6, 10, 64, 64, 0.088f, 0);
+    SDPA_CASE(2, 4, 6, 10, 64, 64, 0.088f, 1);
+    SDPA_CASE(1, 1, 16, 16, 32, 32, 0.125f, 0);
+    SDPA_CASE(1, 1, 16, 16, 32, 32, 0.125f, 1);
+
+    printf("\n=== GEMM (ggml_mul_mat, mock) ===\n");
+    // Real model GEMM shapes (M = output, K = input, N = seq).
+    // bge-small-zh-v1.5: hidden=512, intermediate=2048
+    //   attn Q/K/V/O: M=512 K=512;  ffn_up: M=2048 K=512;  ffn_down: M=512 K=2048
+    // bge-m3:          hidden=1024, intermediate=4096
+    //   attn Q/K/V/O: M=1024 K=1024; ffn_up: M=4096 K=1024; ffn_down: M=1024 K=4096
+    GEMM_CASE(GGML_TYPE_F32,  512,   8,  512);   // bge-small attn
+    GEMM_CASE(GGML_TYPE_F16,  512,   8,  512);   // bge-small attn (FP16 NEON packA)
+    GEMM_CASE(GGML_TYPE_Q8_0, 512,   8,  512);   // bge-small attn (Q8_0 NEON mmla)
+    GEMM_CASE(GGML_TYPE_F16, 2048,   8,  512);   // bge-small ffn_up
+    GEMM_CASE(GGML_TYPE_Q8_0, 2048,  8,  512);   // bge-small ffn_up
+    GEMM_CASE(GGML_TYPE_F16,  512,   8, 2048);   // bge-small ffn_down
+    GEMM_CASE(GGML_TYPE_Q8_0, 512,   8, 2048);   // bge-small ffn_down
+    GEMM_CASE(GGML_TYPE_F32, 1024,   8, 1024);   // bge-m3 attn
+    GEMM_CASE(GGML_TYPE_F16, 1024,   8, 1024);   // bge-m3 attn (FP16 NEON packA)
+    GEMM_CASE(GGML_TYPE_Q8_0, 1024,  8, 1024);   // bge-m3 attn (Q8_0 NEON mmla)
+    GEMM_CASE(GGML_TYPE_F16, 4096,   8, 1024);   // bge-m3 ffn_up
+    GEMM_CASE(GGML_TYPE_Q8_0, 4096,  8, 1024);   // bge-m3 ffn_up
+    GEMM_CASE(GGML_TYPE_F16, 1024,   8, 4096);   // bge-m3 ffn_down
+    GEMM_CASE(GGML_TYPE_Q8_0, 1024,  8, 4096);   // bge-m3 ffn_down
+
+    printf("\n=== %d cases failed ===\n", failures);
+    return failures == 0 ? 0 : 1;
+}

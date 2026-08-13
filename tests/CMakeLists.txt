@@ -160,6 +160,15 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+# fused SDPA + F16/Q8_0 GEMM optimization correctness test (mock-based).
+# No model is required: it feeds synthetic tensors through GGML_OP_FUSED_CPP_SDPA_EXT
+# and ggml_mul_mat on the CPU backend and compares against host-side reference
+# attention / naive matmul implementations.
+# Only built on ARM, where the fused SDPA operator is compiled into ggml-cpu.
+if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64|arm")
+    llama_build_and_test(test-sdpa-f16q80-opt.cpp LABEL "fused-sdpa")
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 
