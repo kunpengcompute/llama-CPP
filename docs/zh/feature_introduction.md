@@ -208,8 +208,6 @@ CFLAGS+=-DGGML_USE_FUSED_CPP_SDPA
 # 默认编译（-O3 RelWithDebInfo，构建 ggml-cpu / llama-embedding / llama-bench / llama-server）
 ./compile.sh build-delivery
 
-# 开启 fused SDPA 的 ARM 编译
-./compile.sh build-fused-sdpa
 ```
 
 **环境变量控制**

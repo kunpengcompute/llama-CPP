@@ -97,8 +97,12 @@ python bench_bgem3_full.py
 
    ```bash
    git apply /home/code/llama-CPP/patch/baseline-bug-fixed.patch
-   cmake -B build -DCMAKE_BUILD_TYPE=Release
-   cmake --build build --target llama-server llama-bench
+   _FLAGS="-O3 -funroll-loops"
+   env CFLAGS="$_FLAGS" CXXFLAGS="$_FLAGS" \
+   cmake -DCMAKE_BUILD_TYPE=Release \
+               -B build-baseline-fixed -GNinja \
+               -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF
+   cmake --build build-baseline-fixed --config release --target ggml-cpu llama-embedding llama-bench llama-server -j 20 
    ```
 
 3. 用该版本启动 server 后，按下面的命令验证精度。

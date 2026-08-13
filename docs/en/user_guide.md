@@ -38,9 +38,6 @@ Use `compile.sh` for one-click building (`compile.sh` is introduced together wit
 ```bash
 # Default build (-O3 RelWithDebInfo; builds ggml-cpu / llama-embedding / llama-bench / llama-server)
 ./compile.sh build-delivery
-
-# ARM build with fused SDPA enabled (-march=armv8.6-a+dotprod+i8mm+sve -O3 -funroll-loops)
-./compile.sh build-fused-sdpa
 ```
 
 Build outputs are located in `build-delivery/bin/` or `build-fused-sdpa/bin/`.
