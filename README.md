@@ -1,116 +1,91 @@
-# llama-CPP
+# llama-CPP介绍
 
-patch基于官方llama.cpp的commit 3ac67535c86，与`swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/llama.cpp:920B-kunpeng`镜像中的commit版本一致。
+## 最新消息
 
-### patch合入
+- [2026.08.12]：面向鲲鹏系列处理器，发布针对社区版llama.cpp（commit `3ac67535c86`）的CPU算子优化补丁合集，聚焦FP16 / FP32 / Q8_0矩阵乘法与融合SDPA注意力算子。
 
-- patch合入：
+## 项目介绍
 
-```shell
-git apply --check /path/to/patches/00*.patch    # 可选：先干跑检查
-git am /path/to/patches/00*.patch
-```
-- 应用时会有几条 trailing whitespace 警告，那是源码本身带的行尾空格（比如 server.cpp、quants.h），不影响结果。
+llama-CPP是针对鲲鹏920B（7280Z）处理器进行的CPU小模型推理性能优化，聚焦llama.cpp推理引擎CPU后端的ARM矩阵乘法与注意力（SDPA）算子，采用ARM NEON / SVE-256 / i8mm指令集充分释放鲲鹏920B的算力，提升矩阵乘法和注意力计算性能。本项目针对社区版llama.cpp输出优化补丁。
 
-- 编译：
+优化能力主要包括：FP16 / FP32 / Q8_0三种数据类型的矩阵乘法kernel、Fused SDPA（FlashAttention v2 NEON融合算子）以及若干基线功能性修复。
 
-```shell
-./compile.sh build-delivery
-```
+## 目录结构
 
-- 启动server（如需）：
-```shell
-taskset -c $(seq -s, 128 2 158) env GGML_FUSED_CPP_SDPA=1 GGML_TOTAL_THREADS=16 OMP_NUM_THREADS=16 ./build-delivery/bin/llama-server --model /path/to/bge-m3-FP16.gguf --embedding --port 9180 --host 0.0.0.0 --ctx-size 8192 --threads 16 --pooling cls
-```
-
-
-patch文件改动
-
-```
-  |-- common/
-  |   |-- CMakeLists.txt  [mod]
-  |   `-- common.cpp  [mod]
-  |-- compile.sh  [+new]
-  |-- ggml/
-  |   |-- include/
-  |   |   |-- ggml-cpu.h  [mod]
-  |   |   `-- ggml.h  [mod]
-  |   `-- src/
-  |       |-- ggml.c  [mod]
-  |       `-- ggml-cpu/
-  |           |-- CMakeLists.txt  [mod]
-  |           |-- ggml-cpu.c  [mod]
-  |           |-- ggml-cpu-quants.c  [mod]
-  |           |-- ggml-cpu-quants.h  [mod]
-  |           |-- ops.cpp  [mod]
-  |           |-- ops.h  [mod]
-  |           |-- vec.cpp  [mod]
-  |           |-- vec.h  [mod]
-  |           `-- fused-cpp/
-  |               `-- fp32_packqkv/
-  |                   |-- fp32_packqkv_sdpa.cpp  [+new]
-  |                   |-- fp32_packqkv_sdpa.h  [+new]
-  |                   |-- parse_embedding_perf_log.py  [+new]
-  |                   `-- csrc/
-  |                       |-- sdpa_common.h  [+new]
-  |                       |-- sdpa_flash2_neon_l3kv_impl.h  [+new]
-  |                       |-- sdpa_pack_utils.h  [+new]
-  |                       |-- sdpa_profile.h  [+new]
-  |                       |-- sdpa_standalone_shim.h  [+new]
-  |                       |-- sdpa_tile_sizes.h  [+new]
-  |                       `-- sdpa_microkernels/
-  |                           |-- mk_traits.h  [+new]
-  |                           |-- neon_cache_config.h  [+new]
-  |                           |-- neon_cache_microkernels.h  [+new]
-  |                           `-- impls/
-  |                               `-- mk_qk_packqk_seq4_bmajor_pv_pquad.h  [+new]
-  |-- src/
-  |   |-- llama-context.cpp  [mod]
-  |   |-- llama-graph.cpp  [mod]
-  |   |-- llama-graph.h  [mod]
-  |   `-- llama-model.cpp  [mod]
-  `-- tools/
-      `-- server/
-          |-- server.cpp  [mod]
-          `-- utils.hpp  [mod]
+```text
+llama-CPP/
+├── patch                                                                    # 补丁文件目录
+│   ├── 0001-fix-common-fix-baseline-embedding-regex-serv-bugs-ad.patch
+│   ├── 0002-feat-cpu-add-ARM-SVE-NEON-FP16-FP32-matmul-kernels.patch
+│   ├── 0003-feat-cpu-add-Q8_0-MMLA-spack-matmul-kernels.patch
+│   ├── 0004-feat-cpu-add-fused-SDPA-microkernels-neon-cache-QK-p.patch
+│   ├── 0005-feat-cpu-add-fused-SDPA-flash2-L3KV-implementation.patch
+│   ├── 0006-feat-cpu-add-fused-SDPA-fp32-packqkv-front-end.patch
+│   ├── 0007-feat-llama-add-GGML-fused-SDPA-op-and-integrate-into.patch
+│   ├── 0008-feat-cpu-wire-optimized-matmul-fused-SDPA-kernels-in.patch
+│   ├── 0009-build-add-compile.sh-helper-for-ARM-builds.patch
+│   ├── 0010-update-compile.sh.patch
+│   └── baseline-bug-fixed.patch                                            # 精度验证基线修复补丁
+├── docs
+│   ├── zh                                                                    # 中文文档目录
+│   │   ├── feature_introduction.md                                            # 特性说明文档
+│   │   ├── menu_llamacpp.md                                                   # 文档指南
+│   │   ├── release_notes.md                                                   # 版本说明书
+│   │   ├── user_guide.md                                                      # 用户指南
+│   │   ├── 技术报告.md                                                        # 精度与性能验证数据
+│   │   ├── 设计摘要.md                                                          # 设计摘要（完整详设文档不随仓库分发）
+│   └── en                                                                    # English document directory
+│       ├── feature_introduction.md
+│       ├── menu_llamacpp.md
+│       ├── release_notes.md
+│       └── user_guide.md
+├── bench_bgem3_full.py                                                      # 整机性能验证脚本
+├── eval_llamacpp_cmteb.py                                                   # C-MTEB精度验证脚本
+├── LICENSE                                                                   # 开源许可证文件(Apache 2.0)
+├── CC-BY                                                                     # 开源文档许可证文件(CC-BY 4.0)
+├── README.md                                                                 # 项目说明文档
+└── README_en.md                                                              # 英文项目说明文档
 ```
 
-### 快速验证
+## 版本说明
 
-#### 性能
-```shell
-# 单核
-taskset -c 128 env  GGML_FUSED_CPP_SDPA=1 GGML_TOTAL_THREADS=1 OMP_NUM_THREADS=1 ./build-delivery/bin/llama-bench -m /path/to/bge-m3-FP16.gguf -p 512 -b 512 -n 0 -t 1 -r 1
-# 整机
-vim bench_bgem3_full.py   #修改顶部的文件路径
-python bench_bgem3_full.py   #最高TPS就是整机最优性能
-```
+llama-CPP本身的版本说明，具体请参见《[版本说明书](./docs/zh/release_notes.md)》。
 
-#### 精度
+## 学习文档
 
- 精度验证前务必将基线使用`baseline-buf-fixed.patch`修复。
- 
- 步骤：
- 1. checkout到官方llama.cpp的commit 3ac67535c86
- 2. git apply baseline-buf-fixed.patch
- 3. 编译，用这个版本来验证精度
- 
- 
- ```shell
- # --servers后面以<server_name>=<server url>设置llama server，空格分离多个server
- # --server-workers数量等于上面的server数，测试几个server就用几个worker
- # --cmteb-root改成你的C-MTEB数据集路径
- # 有哪个Task的分数是NaN，可以再单独跑一下该Task
- 
-python eval_llamacpp_cmteb.py \
---servers baseline=http://141.61.21.62:8080 opt=http://141.61.21.62:7080 \
---server-workers 2 \
---task-names   TNews IFlyTek MultilingualSentiment JDReview OnlineShopping Waimai     CLSClusteringS2S.v2 CLSClusteringP2P.v2 ThuNewsClusteringS2S.v2 ThuNewsClusteringP2P.v2     Ocnli Cmnli     T2Reranking MMarcoReranking CMedQAv1-reranking CMedQAv2-reranking     ATEC BQ LCQMC PAWSX STSB AFQMC QBQTC   \
---cmteb-root /home/l30061571/models/datasets/C-MTEB \
---batch-size 1 \
---max-chars 500 \
---skip-bad-embedding \
---output-dir ./f16-all \
---continue-on-error
- ```
- 
+| 资源名称 | 资源简介 |
+| ------------ | ------------ |
+| [版本说明书](./docs/zh/release_notes.md) | 提供llama-CPP每个发布版本的基础信息和特性更新信息。 |
+| [特性介绍](./docs/zh/feature_introduction.md) | 提供llama-CPP优化说明。 |
+| [用户指南](./docs/zh/user_guide.md) | 提供llama-CPP优化使用说明。 |
+| [技术报告](./docs/zh/技术报告.md) | 提供精度与性能验证数据。 |
+| [设计摘要](./docs/zh/设计摘要.md) | 提供各 kernel 的算法、接口与实现方案的摘要。 |
+
+## 快速开始
+
+1. 基于官方llama.cpp commit `3ac67535c86` checkout代码；
+2. 合入补丁：`git am patch/00*.patch`；
+3. 编译：`./compile.sh build-delivery`；
+4. 性能 / 精度验证参考《[用户指南](./docs/zh/user_guide.md)》。
+
+## 贡献声明
+
+欢迎大家为社区做贡献，如果使用过程中有任何问题/建议，或者需要反馈特性需求和bug报告，可以提交issues联系我们，具体贡献方法可参考[这里](https://gitcode.com/boostkit/community/blob/master/docs/contributor/contributing.md)。同时也欢迎大家在[讨论专区](https://gitcode.com/boostkit/community/discussions)展开讨论交流。感谢您的支持。
+
+## 免责声明
+
+此代码仓计划参与llama.cpp开源组件，编码风格遵照原生开源软件，继承原生开源软件安全设计，不破坏原生开源软件设计及编码风格和方式，软件的任何漏洞与安全问题，均由相应的上游社区根据其漏洞和安全响应机制解决。请密切关注上游社区发布的通知和版本更新。鲲鹏计算社区对软件的漏洞及安全问题不承担任何责任。
+
+## 许可证书
+
+本项目采用Apache License 2.0，详见[LICENSE](./LICENSE)文件。
+本项目文档适用CC-BY 4.0许可证，具体请参见[LICENSE](./docs/LICENSE)文件。
+
+## 致谢
+
+llama-CPP由华为公司的下列部门联合贡献：
+
+鲲鹏计算Boostkit开发部
+计算技术开发部
+
+感谢来自社区的每一个PR，欢迎贡献llama-CPP！
