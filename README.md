@@ -33,12 +33,14 @@ llama-CPP/
 │   │   ├── menu_llamacpp.md                                                   # 文档指南
 │   │   ├── release_notes.md                                                   # 版本说明书
 │   │   ├── user_guide.md                                                      # 用户指南
+│   │   ├── unit_test_guide.md                                                 # 单元测试指南（算子优化单元测试说明）
 │   │   ├── technical_report.md                                                        # 精度与性能验证数据
 │   └── en                                                                    # English document directory
 │       ├── feature_introduction.md
 │       ├── menu_llamacpp.md
 │       ├── release_notes.md
-│       └── user_guide.md
+│       ├── user_guide.md
+│       └── unit_test_guide.md
 ├── bench_bgem3_full.py                                                      # 整机性能验证脚本
 ├── eval_llamacpp_cmteb.py                                                   # C-MTEB精度验证脚本
 ├── LICENSE                                                                   # 开源许可证文件(Apache 2.0)
@@ -58,6 +60,7 @@ llama-CPP本身的版本说明，具体请参见《[版本说明书](./docs/zh/r
 | [版本说明书](./docs/zh/release_notes.md) | 提供llama-CPP每个发布版本的基础信息和特性更新信息。 |
 | [特性介绍](./docs/zh/feature_introduction.md) | 提供llama-CPP优化说明。 |
 | [用户指南](./docs/zh/user_guide.md) | 提供llama-CPP优化使用说明。 |
+| [单元测试指南](./docs/zh/unit_test_guide.md) | 提供算子优化单元测试的编译、执行与预期输出说明。 |
 | [技术报告](./docs/zh/technical_report.md) | 提供精度与性能验证数据。 |
 
 ## 快速开始

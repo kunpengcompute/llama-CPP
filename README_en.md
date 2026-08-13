@@ -33,12 +33,14 @@ llama-CPP/
 │   │   ├── menu_llamacpp.md                                                   # Document guide
 │   │   ├── release_notes.md                                                   # Release notes
 │   │   ├── user_guide.md                                                      # User guide
+│   │   ├── unit_test_guide.md                                                 # Unit test guide
 │   │   ├── technical_report.md                                                        # Accuracy and performance verification data
 │   └── en                                                                    # English document directory
 │       ├── feature_introduction.md
 │       ├── menu_llamacpp.md
 │       ├── release_notes.md
-│       └── user_guide.md
+│       ├── user_guide.md
+│       └── unit_test_guide.md
 ├── bench_bgem3_full.py                                                      # Whole-machine performance verification script
 ├── eval_llamacpp_cmteb.py                                                   # C-MTEB accuracy verification script
 ├── LICENSE                                                                   # Open-source license file (Apache 2.0)
@@ -58,6 +60,7 @@ For details about the llama-CPP version description, see [Release Notes](./docs/
 | [Release Notes](./docs/en/release_notes.md) | Provides basic information and feature updates of each llama-CPP version. |
 | [Feature Introduction](./docs/en/feature_introduction.md) | Provides llama-CPP optimization description. |
 | [User Guide](./docs/en/user_guide.md) | Provides llama-CPP optimization usage description. |
+| [Unit Test Guide](./docs/en/unit_test_guide.md) | Provides instructions for building, running, and expected output of the operator optimization unit tests. |
 
 The Chinese technical report (with accuracy and performance data) is also available under `docs/zh/`.
 
