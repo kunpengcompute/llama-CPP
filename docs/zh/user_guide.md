@@ -1,4 +1,4 @@
-# llama.cpp 推理框架优化适配指南
+# 基于llama.cpp的BGE模型性能优化用户指南
 
 本文档基于鲲鹏处理器平台，提供对社区版 llama.cpp（commit `3ac67535c86`）合入优化补丁、编译、部署并运行 bge-m3 等 Embedding 模型的调优指导步骤。
 
