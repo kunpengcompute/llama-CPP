@@ -1,4 +1,4 @@
-# llama.cpp Inference Framework Optimization Guide
+# User Guide for BGE Model Performance Optimization Based on llama.cpp
 
 This document provides tuning guidance for applying the optimization patches, building, deploying, and running Embedding models such as bge-m3 on Kunpeng processors (using the Kunpeng 920B as an example) with the community llama.cpp (commit `3ac67535c86`).
 
@@ -40,7 +40,7 @@ Use `compile.sh` for one-click building (`compile.sh` is introduced together wit
 ./compile.sh build-delivery
 ```
 
-Build outputs are located in `build-delivery/bin/` or `build-fused-sdpa/bin/`.
+Build outputs are located in `build-delivery/bin/`.
 
 ## Start the Service
 
@@ -54,7 +54,7 @@ taskset -c $(seq -s, 128 2 158) env \
     --ctx-size 8192 --threads 16 --pooling cls
 ```
 
-The `GGML_FUSED_CPP_SDPA` environment variable controls the fused SDPA path:
+The `GGML_FUSED_CPP_SDPA` environment variable controls the fused SDPA path. It is enabled by default and recommended for better performance:
 
 | Environment Variable Value | Effect |
 | -------------------------- | ------ |
@@ -83,11 +83,29 @@ python bench_bgem3_full.py
 
 ## Accuracy Verification
 
-Before accuracy verification, the baseline must be fixed using `patch/baseline-bug-fixed.patch`.
+Before accuracy verification, prepare the official baseline source and fix the baseline using `patch/baseline-bug-fixed.patch`.
 
-1. Check out the official llama.cpp commit `3ac67535c86`;
-2. `git apply patch/baseline-bug-fixed.patch`;
-3. Build and use this version for accuracy verification.
+1. Get the official llama.cpp source and check out the matching commit:
+
+   ```bash
+   git clone https://github.com/ggml-org/llama.cpp.git /home/code/llama.cpp-baseline
+   cd /home/code/llama.cpp-baseline
+   git checkout 3ac67535c86
+   ```
+
+2. Apply the baseline fix patch and build:
+
+   ```bash
+   git apply /home/code/llama-CPP/patch/baseline-bug-fixed.patch
+   _FLAGS="-O3 -funroll-loops"
+   env CFLAGS="$_FLAGS" CXXFLAGS="$_FLAGS" \
+   cmake -DCMAKE_BUILD_TYPE=Release \
+               -B build-baseline-fixed -GNinja \
+               -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF
+   cmake --build build-baseline-fixed --config release --target ggml-cpu llama-embedding llama-bench llama-server -j 20
+   ```
+
+3. Start the server with this version, then verify accuracy using the commands below.
 
 ```bash
 # --servers is followed by <server_name>=<server url>, separated by spaces

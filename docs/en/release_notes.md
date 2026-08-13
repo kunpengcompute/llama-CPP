@@ -30,7 +30,7 @@ Key capabilities:
 
 ### Resolved Issues
 
-None
+Fixed the poor performance of the FP16 and Q8_0 operators on Kunpeng CPUs.
 
 ### Known Issues
 
