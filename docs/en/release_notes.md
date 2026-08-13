@@ -12,13 +12,13 @@
 
 | Operating System | Compiler | CPU Type | Baseline Version |
 | :--- | :--- | :--- | :--- |
-| openEuler 22.03 LTS SP3 | GCC/G++ 15.2.0 or later | Kunpeng 920B (7280Z) | llama.cpp commit `3ac67535c86` |
+| openEuler 22.03 LTS SP3 | GCC/G++ 15.2.0 or later | Kunpeng 920B / Kunpeng 950 | llama.cpp commit `3ac67535c86` |
 
 ## V1.0.0
 
 ### Change Description
 
-llama-CPP is a collection of CPU operator performance optimization patches for the Kunpeng 920B (7280Z) processor. It focuses on the ARM matrix multiplication and attention operators in the llama.cpp inference engine CPU backend, using ARM NEON / SVE-256 / i8mm instructions to achieve Kunpeng-affinity optimization and improve matrix multiplication and attention performance.
+llama-CPP is a collection of CPU operator performance optimization patches for Kunpeng processors. It focuses on the ARM matrix multiplication and attention operators in the llama.cpp inference engine CPU backend, using ARM NEON / SVE-256 / i8mm instructions to achieve Kunpeng-affinity optimization and improve matrix multiplication and attention performance.
 
 Key capabilities:
 
@@ -46,7 +46,6 @@ None
 | User Guide | Provides llama-CPP optimization usage description. | Open-source repository |
 | Feature Introduction | Provides llama-CPP optimization description. | Open-source repository |
 | Technical Report | Provides accuracy and performance verification data. | Open-source repository |
-| Design Summary | Provides a summary of the algorithm and interfaces of each kernel. | Open-source repository |
 
 ### Obtaining Documentation
 

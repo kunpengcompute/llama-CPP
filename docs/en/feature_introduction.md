@@ -1,6 +1,6 @@
 # Feature Introduction
 
-The llama-CPP baseline is based on the official llama.cpp commit `3ac67535c86`. This optimization targets the Kunpeng 920B (7280Z) processor and focuses on the ARM matrix multiplication and attention (SDPA) operators in the CPU backend, covering FP16, FP32, and Q8_0 matrix multiplication as well as fused attention computation. It does not modify the upper-layer APIs or the compute graph structure; instead, it replaces the underlying kernels through the `type_traits` callback registration mechanism of the GGML CPU backend, remaining fully compatible with the non-optimized path.
+The llama-CPP baseline is based on the official llama.cpp commit `3ac67535c86`. This optimization targets Kunpeng processors and focuses on the ARM matrix multiplication and attention (SDPA) operators in the CPU backend, covering FP16, FP32, and Q8_0 matrix multiplication as well as fused attention computation. It does not modify the upper-layer APIs or the compute graph structure; instead, it replaces the underlying kernels through the `type_traits` callback registration mechanism of the GGML CPU backend, remaining fully compatible with the non-optimized path.
 
 The optimization can be divided into four parts: matrix multiplication, fused attention, baseline fixes, and build/runtime helpers. The matrix multiplication part leverages ARM NEON / SVE-256 / i8mm (MMLA) instructions; the fused attention part merges the FlashAttention v2 flow into a single CPU operator to reduce intermediate tensor traffic.
 
@@ -58,4 +58,4 @@ The patches also include functional fixes to the baseline source to ensure fair 
 - `compile.sh`: one-click ARM build script. The `build-fused-sdpa` profile uses `-march=armv8.6-a+dotprod+i8mm+sve -O3 -funroll-loops` with the fused SDPA path enabled; the default profile is `-O3 RelWithDebInfo`, building `ggml-cpu`, `llama-embedding`, `llama-bench`, and `llama-server` via ninja.
 - The `GGML_FUSED_CPP_SDPA` environment variable controls the fused SDPA path (`0`/`off`/`false`/`no` disables it, `debug`/`trace` enables debug logs, empty/other values enable it by default).
 
-For a summary of the kernel algorithms and interfaces, see the Chinese design summary at `docs/zh/设计摘要.md` inside this repository.
+For detailed kernel algorithms, interfaces, and packaging layouts, see the Chinese feature introduction at `docs/zh/feature_introduction.md` and the technical report at `docs/zh/technical_report.md` inside this repository.

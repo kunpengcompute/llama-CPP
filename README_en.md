@@ -2,11 +2,11 @@
 
 ## Latest Updates
 
-- [2026-08-12]: Released a collection of CPU operator optimization patches for the community llama.cpp (commit `3ac67535c86`), targeting the Kunpeng 920B (7280Z) processor, focusing on FP16 / FP32 / Q8_0 matrix multiplication and fused SDPA attention operators.
+- [2026-08-12]: Released a collection of CPU operator optimization patches for the community llama.cpp (commit `3ac67535c86`), targeting Kunpeng processors, focusing on FP16 / FP32 / Q8_0 matrix multiplication and fused SDPA attention operators.
 
 ## Project Introduction
 
-llama-CPP is a performance improvement project for small-model CPU inference based on the Kunpeng 920B (7280Z) processor. It focuses on the ARM matrix multiplication and attention (SDPA) operators in the llama.cpp inference engine CPU backend, leveraging ARM NEON / SVE-256 / i8mm instructions to fully unleash the computing power of the Kunpeng 920B and improve matrix multiplication and attention performance. This project provides optimization patches for the community llama.cpp.
+llama-CPP is a performance improvement project for small-model CPU inference based on Kunpeng processors. It focuses on the ARM matrix multiplication and attention (SDPA) operators in the llama.cpp inference engine CPU backend, leveraging ARM NEON / SVE-256 / i8mm instructions to fully unleash the computing power of Kunpeng processors and improve matrix multiplication and attention performance. This project provides optimization patches for the community llama.cpp.
 
 Main capabilities include: FP16 / FP32 / Q8_0 matrix multiplication kernels, Fused SDPA (FlashAttention v2 NEON fused operator), and several baseline functional fixes.
 
@@ -32,8 +32,7 @@ llama-CPP/
 │   │   ├── menu_llamacpp.md                                                   # Document guide
 │   │   ├── release_notes.md                                                   # Release notes
 │   │   ├── user_guide.md                                                      # User guide
-│   │   ├── 技术报告.md                                                        # Accuracy and performance verification data
-│   │   ├── 设计摘要.md                                                          # Design summary (full design doc is not distributed)
+│   │   ├── technical_report.md                                                        # Accuracy and performance verification data
 │   └── en                                                                    # English document directory
 │       ├── feature_introduction.md
 │       ├── menu_llamacpp.md
@@ -59,7 +58,7 @@ For details about the llama-CPP version description, see [Release Notes](./docs/
 | [Feature Introduction](./docs/en/feature_introduction.md) | Provides llama-CPP optimization description. |
 | [User Guide](./docs/en/user_guide.md) | Provides llama-CPP optimization usage description. |
 
-The Chinese technical report and detailed design document are also available under `docs/zh/`.
+The Chinese technical report (with accuracy and performance data) is also available under `docs/zh/`.
 
 ## Quick Start
 

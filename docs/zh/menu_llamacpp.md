@@ -2,5 +2,4 @@
 - [特性介绍](./feature_introduction.md)
 - [版本说明书](./release_notes.md)
 - [用户指南](./user_guide.md)
-- [技术报告](./技术报告.md)
-- [设计摘要](./设计摘要.md)
+- [技术报告](./technical_report.md)

@@ -1,10 +1,10 @@
 # llama.cpp Inference Framework Optimization Guide
 
-This document provides tuning guidance for applying the optimization patches, building, deploying, and running Embedding models such as bge-m3 on the Kunpeng 920B (7280Z) processor with the community llama.cpp (commit `3ac67535c86`).
+This document provides tuning guidance for applying the optimization patches, building, deploying, and running Embedding models such as bge-m3 on Kunpeng processors (using the Kunpeng 920B as an example) with the community llama.cpp (commit `3ac67535c86`).
 
 ## Environment Requirements
 
-- Hardware platform: Kunpeng 920B (7280Z) processor (NEON / SVE-256 / i8mm)
+- Hardware platform: Kunpeng processor (e.g., Kunpeng 920B; NEON / SVE-256 / i8mm)
 - Operating system: openEuler 22.03 LTS SP3
 - Compiler: GCC/G++ 15.2.0 or later (must support `armv8.6-a+dotprod+i8mm+sve`)
 - Build dependencies: cmake >= 3.20, ninja (recommended), git
@@ -110,4 +110,4 @@ python eval_llamacpp_cmteb.py \
 --continue-on-error
 ```
 
-For detailed kernel interfaces, algorithms, and test criteria, see the technical report and the design summary (Chinese only) under `docs/zh/`.
+For detailed kernel interfaces, algorithms, and test criteria, see the technical report (`technical_report.md`) and feature introduction (`feature_introduction.md`) under `docs/zh/`.

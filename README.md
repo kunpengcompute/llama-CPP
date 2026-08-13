@@ -6,7 +6,7 @@
 
 ## 项目介绍
 
-llama-CPP是针对鲲鹏920B（7280Z）处理器进行的CPU小模型推理性能优化，聚焦llama.cpp推理引擎CPU后端的ARM矩阵乘法与注意力（SDPA）算子，采用ARM NEON / SVE-256 / i8mm指令集充分释放鲲鹏920B的算力，提升矩阵乘法和注意力计算性能。本项目针对社区版llama.cpp输出优化补丁。
+llama-CPP是针对鲲鹏处理器进行的CPU小模型推理性能优化，聚焦llama.cpp推理引擎CPU后端的ARM矩阵乘法与注意力（SDPA）算子，采用ARM NEON / SVE-256 / i8mm指令集充分释放鲲鹏处理器的算力，提升矩阵乘法和注意力计算性能。本项目针对社区版llama.cpp输出优化补丁。
 
 优化能力主要包括：FP16 / FP32 / Q8_0三种数据类型的矩阵乘法kernel、Fused SDPA（FlashAttention v2 NEON融合算子）以及若干基线功能性修复。
 
@@ -32,8 +32,7 @@ llama-CPP/
 │   │   ├── menu_llamacpp.md                                                   # 文档指南
 │   │   ├── release_notes.md                                                   # 版本说明书
 │   │   ├── user_guide.md                                                      # 用户指南
-│   │   ├── 技术报告.md                                                        # 精度与性能验证数据
-│   │   ├── 设计摘要.md                                                          # 设计摘要（完整详设文档不随仓库分发）
+│   │   ├── technical_report.md                                                        # 精度与性能验证数据
 │   └── en                                                                    # English document directory
 │       ├── feature_introduction.md
 │       ├── menu_llamacpp.md
@@ -58,8 +57,7 @@ llama-CPP本身的版本说明，具体请参见《[版本说明书](./docs/zh/r
 | [版本说明书](./docs/zh/release_notes.md) | 提供llama-CPP每个发布版本的基础信息和特性更新信息。 |
 | [特性介绍](./docs/zh/feature_introduction.md) | 提供llama-CPP优化说明。 |
 | [用户指南](./docs/zh/user_guide.md) | 提供llama-CPP优化使用说明。 |
-| [技术报告](./docs/zh/技术报告.md) | 提供精度与性能验证数据。 |
-| [设计摘要](./docs/zh/设计摘要.md) | 提供各 kernel 的算法、接口与实现方案的摘要。 |
+| [技术报告](./docs/zh/technical_report.md) | 提供精度与性能验证数据。 |
 
 ## 快速开始
 

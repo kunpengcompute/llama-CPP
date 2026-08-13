@@ -4,7 +4,7 @@
 
 ## 环境要求
 
-- 硬件平台：鲲鹏 920B（7280Z）处理器（NEON / SVE-256 / i8mm）
+- 硬件平台：鲲鹏处理器（以鲲鹏 920B 系列为例，NEON / SVE-256 / i8mm）
 - 操作系统：openEuler 22.03 LTS SP3
 - 编译器：GCC/G++ 15.2.0 或更新版本（需支持 `armv8.6-a+dotprod+i8mm+sve`）
 - 构建依赖：cmake >= 3.20、ninja（推荐）、git
@@ -83,11 +83,25 @@ python bench_bgem3_full.py
 
 ## 精度验证
 
-精度验证前，务必将基线使用 `patch/baseline-bug-fixed.patch` 修复。
+精度验证前，需先准备官方基线代码，并将基线使用 `patch/baseline-bug-fixed.patch` 修复。
 
-1. checkout 到官方 llama.cpp 的 commit `3ac67535c86`；
-2. `git apply patch/baseline-bug-fixed.patch`；
-3. 编译并用这个版本验证精度。
+1. 获取官方 llama.cpp 源码并 checkout 到对应 commit：
+
+   ```bash
+   git clone https://github.com/ggml-org/llama.cpp.git /home/code/llama.cpp-baseline
+   cd /home/code/llama.cpp-baseline
+   git checkout 3ac67535c86
+   ```
+
+2. 应用基线修复补丁并编译：
+
+   ```bash
+   git apply /home/code/llama-CPP/patch/baseline-bug-fixed.patch
+   cmake -B build -DCMAKE_BUILD_TYPE=Release
+   cmake --build build --target llama-server llama-bench
+   ```
+
+3. 用该版本启动 server 后，按下面的命令验证精度。
 
 ```bash
 # --servers 后面以 <server_name>=<server url> 设置 llama server，空格分离多个 server
@@ -107,4 +121,4 @@ python eval_llamacpp_cmteb.py \
 --continue-on-error
 ```
 
-详细的 kernel 接口、算法与测试标准，请参见《[技术报告](./技术报告.md)》与《[设计摘要](./设计摘要.md)》。
+详细的 kernel 接口、算法与测试标准，请参见《[技术报告](./technical_report.md)》与《[特性介绍](./feature_introduction.md)》。
