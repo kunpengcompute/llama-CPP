@@ -6,7 +6,7 @@
 
 | 产品名称 | 产品版本 | 软件名称 | 软件包版本 |
 | :--- | :--- | :--- | :--- |
-| Kunpeng BoostKit | 26.8.RC1 | llama-CPP | V1.0.0 |
+| Kunpeng BoostKit | 26.2.RC1 | llama-CPP | V1.0.0 |
 
 ### 与操作系统、编译器和 CPU 配套说明
 
@@ -18,15 +18,15 @@
 
 ### 更新说明
 
-llama-CPP 是针对鲲鹏处理器进行的 CPU 算子性能优化补丁合集，聚焦 llama.cpp 推理引擎 CPU 后端的 ARM 矩阵乘法与注意力算子，采用 ARM NEON / SVE-256 / i8mm 指令集实现鲲鹏亲和优化，提升矩阵乘法与注意力计算性能。
+llama-CPP是针对鲲鹏处理器进行的CPU算子性能优化补丁合集，聚焦llama.cpp推理引擎CPU后端的ARM矩阵乘法与注意力算子，采用ARM NEON/SVE-256/i8mm指令集实现鲲鹏亲和优化，提升矩阵乘法与注意力计算性能。
 
-主要优化能力：
+主要优化以下能力。
 
-- FP16 矩阵乘法优化：NEON 软件流水线点积、4×4 外积 tile、outer-packA 8×16 手写外积 kernel；
-- FP32 矩阵乘法优化：SVE 4×4 tile kernel；
-- Q8_0 量化矩阵乘法优化：MMLA（i8mm）+ Spack 数据打包；
-- Fused SDPA（FlashAttention v2 NEON 融合算子）与对角分块优化；
-- 基线 embedding normalize / similarity 双精度修复及 server 输出路径相关修复。
+- FP16矩阵乘法优化：NEON软件流水线点积、4×4外积tile、outer-packA 8×16手写外积kernel。
+- FP32矩阵乘法优化：SVE 4×4 tile kernel。
+- Q8_0量化矩阵乘法优化：MMLA（i8mm+Spack数据打包。
+- Fused SDPA（FlashAttention v2 NEON融合算子）与对角分块优化。
+- 基线embedding normalize/similarity双精度修复及server输出路径相关修复。
 
 ### 已解决的问题
 
@@ -38,15 +38,15 @@ llama-CPP 是针对鲲鹏处理器进行的 CPU 算子性能优化补丁合集�
 
 ## 版本配套文档
 
-### V1.0.0 版本配套文档
+### V1.0.0版本配套文档
 
 | 文档名称 | 内容简介 | 交付方式 |
 | :--- | :--- | :--- |
-| 版本说明书 | 提供 llama-CPP 每个发布版本的基础信息和特性更新信息。 | 开源仓 |
-| 用户指南 | 提供 llama-CPP 优化使用说明。 | 开源仓 |
-| 特性介绍 | 提供 llama-CPP 优化说明。 | 开源仓 |
+| 版本说明书 | 提供llama-CPP每个发布版本的基础信息和特性更新信息。 | 开源仓 |
+| 用户指南 | 提供llama-CPP优化使用说明。 | 开源仓 |
+| 特性介绍 | 提供llama-CPP优化说明。 | 开源仓 |
 | 技术报告 | 提供精度与性能验证数据。 | 开源仓 |
 
 ### 获取文档的方法
 
-您可以通过访问开源仓 llama-CPP 浏览和获取相关文档。
+您可以通过访问[开源仓](https://gitcode.com/boostkit/llama-CPP/blob/opt/docs)浏览和获取相关文档。

@@ -1,31 +1,36 @@
-# 精度验证
+# 技术报告
+
+## 精度验证
+
  精度验证前务必将基线使用`baseline-buf-fixed.patch`修复。
- 
- 步骤：
- 1. checkout到官方llama.cpp的commit 3ac67535c86
- 2. git apply baseline-buf-fixed.patch
- 3. 编译，用这个版本来验证精度
- 
- 
+
+ 步骤如下。
+
+ 1. checkout到官方llama.cpp的commit 3ac67535c86。
+ 2. 执行命令`git apply baseline-buf-fixed.patch`。
+ 3. 编译，用这个版本来验证精度。
+
  ```shell
- # --servers后面以<server_name>=<server url>设置llama server，空格分离多个server
- # --server-workers数量等于上面的server数，测试几个server就用几个worker
- # --cmteb-root改成你的C-MTEB数据集路径
- # 有哪个Task的分数是NaN，可以再单独跑一下该Task
- 
-python eval_llamacpp_cmteb.py \
---servers baseline=http://141.61.21.62:8080 opt=http://141.61.21.62:7080 \
---server-workers 2 \
---task-names   TNews IFlyTek MultilingualSentiment JDReview OnlineShopping Waimai     CLSClusteringS2S.v2 CLSClusteringP2P.v2 ThuNewsClusteringS2S.v2 ThuNewsClusteringP2P.v2     Ocnli Cmnli     T2Reranking MMarcoReranking CMedQAv1-reranking CMedQAv2-reranking     ATEC BQ LCQMC PAWSX STSB AFQMC QBQTC   \
---cmteb-root /home/l30061571/models/datasets/C-MTEB \
---batch-size 1 \
---max-chars 500 \
---skip-bad-embedding \
---output-dir ./f16-all \
---continue-on-error
+ python eval_llamacpp_cmteb.py \
+ --servers baseline=http://141.61.21.62:8080 opt=http://141.61.21.62:7080 \
+ --server-workers 2 \
+ --task-names   TNews IFlyTek MultilingualSentiment JDReview OnlineShopping Waimai     CLSClusteringS2S.v2 CLSClusteringP2P.v2 ThuNewsClusteringS2S.v2 ThuNewsClusteringP2P.v2     Ocnli Cmnli     T2Reranking MMarcoReranking CMedQAv1-reranking CMedQAv2-reranking     ATEC BQ LCQMC PAWSX STSB AFQMC QBQTC   \
+ --cmteb-root /home/l30061571/models/datasets/C-MTEB \
+ --batch-size 1 \
+ --max-chars 500 \
+ --skip-bad-embedding \
+ --output-dir ./f16-all \
+ --continue-on-error
  ```
 
-CMTEB精度结果参考：
+>**说明:**
+>
+>- servers后面以`server_name>=<server url`设置llama server，使用空格分离多个server。
+>- server-workers数量等于上面的server数量，测试几个server就用几个worker。
+>- cmteb-root改成自己的C-MTEB数据集路径。
+>- 如果Task的分数是NaN，可以再运行该Task。
+
+CMTEB精度结果参考。
 
 | Task                    | F16-baseline-fixed | F16-opt    | Q80-opt    | F16精度损失 | Q80精度损失 |
 | ----------------------- | ------------------ | ---------- | ---------- | ----------- | ----------- |
@@ -49,23 +54,26 @@ CMTEB精度结果参考：
 | Waimai                  | 83.14%             | 83.14%     | 83.14%     | 0.00%       | 0.00%       |
 | 平均                    | **56.10%**         | **56.07%** | **56.02%** | **-0.03%**  | **-0.08%**  |
 
+## 性能验证
 
-
-# 性能验证
+### 单核验证
 
 ```shell
-# 单核
 taskset -c 128 env  GGML_FUSED_CPP_SDPA=1 GGML_TOTAL_THREADS=1 OMP_NUM_THREADS=1 ./build-delivery/bin/llama-bench -m /path/to/bge-m3-FP16.gguf -p 512 -b 512 -n 0 -t 1 -r 1
-# 整机
-vim bench_bgem3_full.py   #修改顶部的文件路径
-python bench_bgem3_full.py   #最高TPS就是整机最优性能
 ```
 
-优化后性能参考：
+### 整机验证
 
-- Kunpeng 920 7280Z(基频2.9GHz，80Core * 2 * 2)， 4800 MT/s * 16 64G
+```shell
+vim bench_bgem3_full.py   
+python bench_bgem3_full.py   
+```
 
-单核：
+### 优化性能参考
+
+#### Kunpeng 920处理器(基频2.9GHz，80Core*2*2)，4.8GMT/s*16 64G优化后性能参考
+
+**单核优化后性能。**
 
 | 模型              | 精度 |   参数量 |   模型大小 | Baseline (t/s) | Optimized (t/s) |   提升倍率 |     性能提升 |
 | :---------------- | :--- | -------: | ---------: | -------------: | --------------: | ---------: | -----------: |
@@ -74,9 +82,9 @@ python bench_bgem3_full.py   #最高TPS就是整机最优性能
 | bge-small-zh-v1.5 | FP16 |  23.69 M |  45.24 MiB |         488.32 |     **4753.50** |  **9.73×** | **+873.45%** |
 | bge-small-zh-v1.5 | Q8_0 |  23.69 M |  24.82 MiB |        1024.32 |     **4624.93** |  **4.52×** | **+351.52%** |
 
-整机：
+**整机优化后性能。**
 
-FP16 优化后，最优TPS：31097，整机开箱最优3352
+FP16优化后，最优TPS为31097，整机开箱最优为3352。
 
 | 实例 | 核/实例    |        TPS |  P50 |  P99 |  Avg | 平均每个时延 |
 | ---: | :--------- | ---------: | ---: | ---: | ---: | -----------: |
@@ -100,7 +108,9 @@ FP16 优化后，最优TPS：31097，整机开箱最优3352
 |   80 | 2（BS=4）  |     29,451 | 2709 | 2807 | 2711 |              |
 |  160 | 1          |     30,212 | 1330 | 1428 | 1332 |              |
 
-Q80优化后，最优TPS：32148，开箱：9952
+**Q80优化优化后性能。**
+
+Q80优化后，最优TPS为32148，开箱最优为9952。
 
 | 实例 | 核/实例 | TPS | P50 | P99 | Avg | 平均每个时延 |
 |---:|:---|---:|---:|---:|---:|---:|
@@ -124,13 +134,12 @@ Q80优化后，最优TPS：32148，开箱：9952
 | 80 | 2（BS=4） | 31,826 | 2542 | 2602 | 2543 |  |
 | 160 | 1 | 31,468 | 1267 | 1344 | 1268 |  |
 
+#### Kunpeng 950处理器(基频2.3GHz，96Core*2*2)，6.4GT/s*12 96GB（只插了一半内存）优化后性能参考
 
+**对比9654。**
 
-- Kunpeng 950(基频2.3GHz，96Core * 2 * 2)， 6400 MT/s * 12  96 GB（只插了一半内存）
-
-对比9654：
 | 模型 | 测试项 | 950-开箱 | 9654-开箱 | 950-优化后 | 相比9654提升倍率 |
-|:-----|:------|---------:|----------:|-----------:|----------------:|
+| :----- | :------ | ---------: | ----------: | -----------: | -------------: |
 | bge-small-zh-v1.5 | 16物理核 | 12932.70 | 7471.00 | **45252.71** | **6.06×** |
 | bge-small-zh-v1.5 | 单核 | 901.60 | 552.59 | **4266.47** | **7.72×** |
 | bge-m3 | 16物理核 | 643.30 | 398.92 | **2591.14** | **6.50×** |
@@ -140,7 +149,7 @@ Q80优化后，最优TPS：32148，开箱：9952
 | toolcall-0.6b | 16物理核-prefill | 474.83 | 271.31 | **1467.07** | **5.41×** |
 | toolcall-0.6b | 16物理核-decode | 85.55 | 52.27 | **89.03** | **1.70×** |
 
-单核对比基线：
+**单核对比基线。**
 
 | 模型 | 精度 | 参数量 | 模型大小 | Baseline (t/s) | Optimized (t/s) | 提升倍率 | 性能提升 |
 | :---------------- | :---- | -------: | ---------: | -------------: | --------------: | ---------: | -----------: |
@@ -149,10 +158,10 @@ Q80优化后，最优TPS：32148，开箱：9952
 | bge-small-zh-v1.5 | FP16 | 23.69 M | 45.24 MiB | 760.05 | **4175.56** | **5.49×** | **+449.38%** |
 | bge-small-zh-v1.5 | Q8_0 | 23.69 M | 24.82 MiB | 1116.75 | **5702.74** | **5.11×** | **+410.66%** |
 
+**整机优化后性能。**
 
+FP16优化后，最高TPS为30037，开箱最优为7758。
 
-
-整机：FP16优化后，最高TPS：30037，开箱7758
 | 实例 | 核/实例    |        TPS |  P50 |  P99 |  Avg | 平均每个时延 |
 | ---: | :--------- | ---------: | ---: | ---: | ---: | -----------: |
 |    1 | 192        |      3,050 |   64 |  494 |   84 |              |
@@ -175,7 +184,9 @@ Q80优化后，最优TPS：32148，开箱：9952
 |   96 | 2          |     29,635 |  816 |  852 |  801 |              |
 |  192 | 1          |     25,995 | 1685 | 2080 | 1731 |              |
 
-Q80优化后，最优TPS：43712，开箱：13257
+**Q80优化后性能。**
+
+最优TPS为43712，开箱最优为13257。
 
 | 实例 | 核/实例 | TPS | P50 | P99 | Avg | 平均每个时延 |
 |---:|:---|---:|---:|---:|---:|---:|
@@ -204,3 +215,5 @@ Q80优化后，最优TPS：43712，开箱：13257
 | 96 | 2（BS=1） | 43,648 | 549 | 573 | 549 | 549 |
 | 96 | 2（BS=2） | 34,825 | 1,131 | 1,475 | 1,245 | 622.5 |
 | 192 | 1 | 34,383 | 1,157 | 1,500 | 1,254 | 1,254.00 |
+
+## 修订记录
