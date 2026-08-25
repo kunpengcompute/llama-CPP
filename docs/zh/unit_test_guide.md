@@ -6,7 +6,7 @@
 
 | 路径 | ggml 算子 |
 |------|-----------|
-| 融合注意力（SDPA | `GGML_OP_FUSED_CPP_SDPA_EXT`（`ggml_fused_cpp_sdpa_ext`）|
+| 融合注意力（SDPA） | `GGML_OP_FUSED_CPP_SDPA_EXT`（`ggml_fused_cpp_sdpa_ext`）|
 | 矩阵乘（GEMM）   | `ggml_mul_mat`（F32/F16/Q8_0权重）                       |
 
 测试不依赖模型文件或任何外部输入：进程内生成合成张量，经真实ggml CPU计算图执行端到端推理，并与C++数学参考实现比对。
@@ -30,25 +30,25 @@ B=1 H=1 L=16 S=16 D=32  DV=32  scale=0.125  mask=1
 
 **GEMM shape取自真实embedding模型的线性层。**
 
-- **bge-small-zh-v1.5**：`hidden=512, intermediate=2048` → attn Q/K/V/O `M=512,K=512`，ffn_up `M=2048,K=512`，ffn_down `M=512,K=2048`
-- **bge-m3**：`hidden=1024, intermediate=4096` → attn `M=1024,K=1024`，ffn_up `M=4096,K=1024`，ffn_down `M=1024,K=4096`
+- **bge-small-zh-v1.5**：`hidden=512, intermediate=2048` -&gt; attn Q/K/V/O `M=512,K=512`，ffn_up `M=2048,K=512`，ffn_down `M=512,K=2048`
+- **bge-m3**：`hidden=1024, intermediate=4096` -&gt; attn `M=1024,K=1024`，ffn_up `M=4096,K=1024`，ffn_down `M=1024,K=4096`
 
 ```text
 权重类型  M    N    K    对应层（模型）
 f32     512    8  512  attn（bge-small）
-f16     512    8  512  attn（bge-small）→ FP16 NEON GEMM
-q8_0    512    8  512  attn（bge-small）→ Q8_0 NEON GEMM
-f16    2048    8  512  ffn_up（bge-small）→ FP16 NEON GEMM
-q8_0   2048    8  512  ffn_up（bge-small）→ Q8_0 NEON GEMM
-f16     512    8 2048  ffn_down（bge-small）→ FP16 NEON GEMM
-q8_0    512    8 2048  ffn_down（bge-small）→ Q8_0 NEON GEMM
+f16     512    8  512  attn（bge-small）-> FP16 NEON GEMM
+q8_0    512    8  512  attn（bge-small）-> Q8_0 NEON GEMM
+f16    2048    8  512  ffn_up（bge-small）-> FP16 NEON GEMM
+q8_0   2048    8  512  ffn_up（bge-small）-> Q8_0 NEON GEMM
+f16     512    8 2048  ffn_down（bge-small）-> FP16 NEON GEMM
+q8_0    512    8 2048  ffn_down（bge-small）-> Q8_0 NEON GEMM
 f32    1024    8 1024  attn（bge-m3）
-f16    1024    8 1024  attn（bge-m3）→ FP16 NEON GEMM
-q8_0   1024    8 1024  attn（bge-m3）→ Q8_0 NEON GEMM
-f16    4096    8 1024  ffn_up（bge-m3）→ FP16 NEON GEMM
-q8_0   4096    8 1024  ffn_up（bge-m3）→ Q8_0 NEON GEMM
-f16    1024    8 4096  ffn_down（bge-m3）→ FP16 NEON GEMM
-q8_0   1024    8 4096  ffn_down（bge-m3）→ Q8_0 NEON GEMM
+f16    1024    8 1024  attn（bge-m3）-> FP16 NEON GEMM
+q8_0   1024    8 1024  attn（bge-m3）-> Q8_0 NEON GEMM
+f16    4096    8 1024  ffn_up（bge-m3）-> FP16 NEON GEMM
+q8_0   4096    8 1024  ffn_up（bge-m3）-> Q8_0 NEON GEMM
+f16    1024    8 4096  ffn_down（bge-m3）-> FP16 NEON GEMM
+q8_0   1024    8 4096  ffn_down（bge-m3）-> Q8_0 NEON GEMM
 ```
 
 ### 2.3 测试涉及的关键路径函数
@@ -58,26 +58,16 @@ q8_0   1024    8 4096  ffn_down（bge-m3）→ Q8_0 NEON GEMM
 
 | 路径 | 涉及函数 |
 | ------ | ---------- |
-| F16 GEMM（NEON） | `matmul_outer_packA_b_g_b16` → `matmul_outer_8x16_b_micro_packA_f16` / `matmul_outer_4x16_b_micro_packA_f16`；leftover 走 `ggml_matmul_f16_4x4_kernel` |
-| Q8_0 GEMM（NEON） | `matmul_q8_0_mmla_spack_b_g` → `matmul_q8_0_mmla_8x8_b_micro_spack_neon` / `matmul_q8_0_mmla_4x4_b_micro_spack_neon` |
+| F16 GEMM（NEON） | `matmul_outer_packA_b_g_b16` -&gt; `matmul_outer_8x16_b_micro_packA_f16` / `matmul_outer_4x16_b_micro_packA_f16`；leftover 走 `ggml_matmul_f16_4x4_kernel` |
+| Q8_0 GEMM（NEON） | `matmul_q8_0_mmla_spack_b_g` -&gt; `matmul_q8_0_mmla_8x8_b_micro_spack_neon` / `matmul_q8_0_mmla_4x4_b_micro_spack_neon` |
 | F32 GEMM | `ggml_matmul_f32_4x4_kernel` |
-| 融合 SDPA | `ggml_compute_forward_fused_cpp_sdpa_ext` → `fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp` / `..._mask_f16` / `..._mask_f32` |
+| 融合 SDPA | `ggml_compute_forward_fused_cpp_sdpa_ext` -&gt; `fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp` / `..._mask_f16` / `..._mask_f32` |
 
 > **说明**：`f16`与`q8_0`会命中上述NEON GEMM加速内核；`f32`作为参考基线对照。
 
 ## 3. 测试原理
 
-1. 用带种子的伪随机函数生成合成数据（可复现）。
-2. 数据写入ggml张量，构建计算图并在CPU后端执行。
-3. C++参考实现计算期望结果。
-4. 以归一化均方误差（NMSE）判定。
-
-   ```bash
-   nmse(a, b) = Σ(a - b)² / Σa²
-   ```
-
-   阈值：fused SDPA`NMSE < 1e-4`；GEMM按权重类型区分——F32/Q8_0`NMSE < 1e-4`；
-   F16`NMSE < 5e-3`（FP16累加精度随K增大而降低，故F16阈值放宽）。
+测试用带种子的伪随机函数生成可复现的合成数据，将数据写入ggml张量，构建计算图并在CPU后端执行，再由C++参考实现计算期望结果，最后以归一化均方误差（NMSE，`nmse(a, b) = Σ(a - b)² / Σa²`）判定结果是否正确。判定阈值如下：fused SDPA `NMSE < 1e-4`；GEMM按权重类型区分，F32/Q8_0 `NMSE < 1e-4`，F16 `NMSE < 5e-3`（FP16累加精度随K增大而降低，故F16阈值放宽）。
 
 ### 3.1 SDPA参考
 
@@ -181,3 +171,7 @@ Total Test time (real) =   0.62 sec
 ```
 
 ## 修订记录
+
+| 发布日期 | 修订记录 |
+| :--- | :--- |
+| 2026-08-24 | 第一次正式发布。<br>- 将测试原理的有序描述调整为段落描述，避免被误认为操作步骤。<br>- 将特殊箭头符号替换为`-&gt;`。 |

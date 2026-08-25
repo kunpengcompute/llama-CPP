@@ -2,11 +2,11 @@
 
 ## 调优概述
 
-本文档基于鲲鹏处理器平台，提供针对社区版llama.cpp（commit `3ac67535c86`）合入优化补丁、编译、部署并运行 bge-m3 等 Embedding 模型的调优指导步骤。
+本文档基于鲲鹏950/鲲鹏920B平台，提供针对官方llama.cpp（commit `3ac67535c86`）合入优化补丁、编译、部署并运行 bge-m3 等 Embedding 模型的调优指导步骤。
 
 ## 环境要求
 
-- 硬件平台：鲲鹏处理器（以鲲鹏920新型号处理器为例，NEON / SVE-256 / i8mm）
+- 硬件平台：鲲鹏950/鲲鹏920B（NEON / SVE-256 / i8mm）
 - 操作系统：openEuler 22.03 LTS SP3
 - 编译器：GCC/G++ 15.2.0或更新版本（需支持 `armv8.6-a+dotprod+i8mm+sve`）
 - 构建依赖：cmake >= 3.20、ninja（推荐）、git
@@ -14,7 +14,7 @@
 
 ## 适配优化补丁
 
-本优化补丁基于官方llama.cpp 的 commit `3ac67535c86`，与镜像`swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/llama.cpp:920B-kunpeng`中的commit 版本一致。
+本优化补丁基于官方llama.cpp（commit `3ac67535c86`），与镜像`swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/llama.cpp:920B-kunpeng`中的commit 版本一致。
 
 1. 拉取代码，此处以`/home/code`为例。
 
@@ -62,7 +62,7 @@ taskset -c $(seq -s, 128 2 158) env \
 
 | 环境变量值 | 效果 |
 | ---------- | ---- |
-| `0` / `off` / `false` / `no` | 关闭fused SDPA，回退到开源flash_attn |
+| `0` / `off` / `false` / `no` | 关闭fused SDPA，回退到官方flash_attn |
 | `debug` / `trace` | 启用fused SDPA调试日志 |
 | 空 /其他 | 默认启用 |
 
@@ -87,7 +87,7 @@ python bench_bgem3_full.py
 
 ## 精度验证
 
-精度验证前，需先准备官方基线代码，并使用`patch/baseline-bug-fixed.patch`将基线修复。
+精度验证前，需先准备官方llama.cpp（commit `3ac67535c86`）源码，并使用`patch/baseline-bug-fixed.patch`修复其中的基线问题。
 
 1. 获取官方llama.cpp源码并checkout到对应commit。
 
@@ -134,3 +134,7 @@ python eval_llamacpp_cmteb.py \
 详细的kernel接口、算法与测试标准，请参见《[技术报告](./technical_report.md)》与《[特性介绍](./feature_introduction.md)》。
 
 ## 修订记录
+
+| 发布日期 | 修订记录 |
+| :--- | :--- |
+| 2026-08-24 | 第一次正式发布。<br>- 统一llama.cpp相关描述为官方llama.cpp（commit `3ac67535c86`）。<br>- 处理器名称统一为鲲鹏950/鲲鹏920B，并移除处理器示例表述。 |

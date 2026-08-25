@@ -1,5 +1,7 @@
 # Introduction to llama-CPP
 
+English | [简体中文](./README.md)
+
 ## Latest Updates
 
 - [2026-08-12]: Released a collection of CPU operator optimization patches for the community llama.cpp (commit `3ac67535c86`), targeting Kunpeng processors, focusing on FP16 / FP32 / Q8_0 matrix multiplication and fused SDPA attention operators.
