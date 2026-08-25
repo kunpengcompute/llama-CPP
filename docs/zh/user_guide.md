@@ -24,14 +24,11 @@
    git clone <llama-CPP 仓库地址> && cd llama-CPP
    ```
 
-2. 合入优化补丁（先运行检查，再正式合入）。
+2. 合入优化补丁。
 
    ```bash
-   git apply --check /home/code/llama-CPP/patch/00*.patch    
    git am /home/code/llama-CPP/patch/00*.patch
    ```
-
-   应用时会出现trailing whitespace警告，这是源码本身带的行尾空格（如 `server.cpp`、`quants.h`），不影响结果。
 
 ## 编译
 

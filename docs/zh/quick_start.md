@@ -37,19 +37,11 @@ llama-CPP优化补丁位于仓库`patch/`目录下的`0001`至`0011`补丁文件
    cd <llama-CPP 仓库路径>
    ```
 
-2. 先运行检查，确认补丁可以正常应用。
-
-   ```bash
-   git apply --check /path/to/llama-CPP/patch/00*.patch
-   ```
-
-3. 正式合入优化补丁。
+2. 正式合入优化补丁。
 
    ```bash
    git am /path/to/llama-CPP/patch/00*.patch
    ```
-
-应用时会出现trailing whitespace警告，这是源码本身带的行尾空格（如`server.cpp`、`quants.h`），不影响结果。
 
 ## 3. 编译
 

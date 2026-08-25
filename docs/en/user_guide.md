@@ -22,14 +22,11 @@ The patches are based on the official llama.cpp commit `3ac67535c86`, matching t
    git clone <llama-CPP repository URL> && cd llama-CPP
    ```
 
-2. Apply the optimization patches (optionally dry-run first, then apply officially).
+2. Apply the optimization patches.
 
    ```bash
-   git apply --check /home/code/llama-CPP/patch/00*.patch    # optional: dry-run check
    git am /home/code/llama-CPP/patch/00*.patch
    ```
-
-   A few trailing-whitespace warnings may appear during application; these come from whitespace at line ends in the source itself (for example, `server.cpp` and `quants.h`) and do not affect the result.
 
 ## Build
 
