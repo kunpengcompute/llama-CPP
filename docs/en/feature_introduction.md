@@ -19,9 +19,9 @@ Data flow: the application enters the inference loop through `llama_eval()` → 
 
 When model weights are F16, matrix multiplication mainly occurs in the prefill phase and is the most frequent computation pattern. Four levels of kernels are provided to cover different M and N configurations.
 
-**vec_dot_f16 (NEON software-pipelined dot product, general fallback)**
+### vec_dot_f16 (NEON software-pipelined dot product, general fallback)
 
-```
+```bash
 1. Initialize 8 float16x8_t accumulators (acc0..acc7)
 2. Prefetch the first 64 elements into ax0..ax7 / ay0..ay7
 3. Main loop (i=64; i<np; i+=64):
@@ -32,9 +32,9 @@ When model weights are F16, matrix multiplication mainly occurs in the prefill p
 5. vpaddq_f16 horizontal add + vcvt_f32_f16 to f32 sum
 ```
 
-**FP16 4×4 tile kernel (NEON outer product)**
+### FP16 4×4 tile kernel (NEON outer product)
 
-```
+```bash
 1. N==1 fast path: loop over M rows with one vfmaq_f16 accumulate per row
 2. 4×4 tile main loop:
    - load A[j..j+3][k..k+8], B[i..i+3][k..k+8]
@@ -45,9 +45,9 @@ When model weights are F16, matrix multiplication mainly occurs in the prefill p
 
 Suited to small prefill batches (M<16).
 
-**FP16 outer-packA 8×16 kernel (hand-written NEON outer product, large prefill batches)**
+### FP16 outer-packA 8×16 kernel (hand-written NEON outer product, large prefill batches)
 
-```
+```bash
 Input: packA (prepacked A)[M_packed, K], B[N,K] (fp16); constraints M%16==0, N%8==0
 1. Main loop (N in 8s, M in 16s): initialize 16 NEON accumulators (v12..v27)
 2. K main loop (step=32, double block):
@@ -65,7 +65,7 @@ Implemented in `ggml/src/ggml-cpu/vec.cpp` / `vec.h`.
 
 An SVE 4×4 tile kernel is implemented using the 8-lane FP32 parallelism of 256-bit SVE, computing 4×4=16 dot products at once:
 
-```
+```bash
 1. N/M 4-aligned main loop: initialize 16 svfloat32_t accumulators (acc[0..3][0..3])
 2. Chunk K by vl (vector length):
    - load A[j+0..3][k..k+vl] into j0..j3
@@ -82,7 +82,7 @@ The Q8_0 optimization delivers the largest performance gain of this work. Core i
 
 Each Q8_0 block contains 32 int8 quantized values and one fp16 scale. The dot product of two blocks is:
 
-```
+```bash
 Σk (da×qa[k]) × (db×qb[k]) = (da×db) × Σk qa[k]×qb[k]
 
 int32_sum = Σ qa × qb            # computed with SMMLA
@@ -90,17 +90,17 @@ float_sum = int32_sum × scale_a × scale_b
 C        += float_sum
 ```
 
-**Packing layout (Spack)**
+### Packing layout (Spack)
 
 - A is packed in groups of 2 rows: one Q8_0 block of every two A rows is packed into four segments +0/+16/+32/+48, each 16 bytes with the first 8 bytes being the 8 int8 values of row 0 and the last 8 bytes the 8 int8 values of row 1, exactly forming the 2-row × 8-K input needed by SMMLA;
 - B is packed in groups of 4 rows: one block of every four B rows is packed into eight segments +0/+16/+32/+48/+64/+80/+96/+112, corresponding to the combinations of cols0/1, cols2/3 and K0..7, 8..15, 16..23, 24..31;
 - The same A panel is reused across multiple N tiles, avoiding repeated packing of A.
 
-**Tiling strategy**
+### Tiling strategy
 
 Outer tile M=128 × N=64, K tile=2048, micro tile 8×8. The full flow:
 
-```
+```bash
 Full Q8_0 MatMul
 ├─ Zero C
 ├─ M tiling: up to 128 A rows each time
@@ -130,9 +130,9 @@ The native llama.cpp attention executes QKᵀ, scaling, mask, softmax, and PV as
 
 When satisfied, the `GGML_OP_FUSED_CPP_SDPA_EXT` op is built to replace the native flash_attn.
 
-**Inference flow**
+### Inference flow
 
-```
+```bash
 build_attn_mha()
 ├─ use_fused_cpp_attn?
 │  ├─ YES → ggml_fused_cpp_sdpa_ext(q, k, v, mask, scale)
@@ -191,25 +191,22 @@ The patches also include functional fixes to the baseline source to ensure fair 
 
 ## Build and Runtime Helpers
 
-**Compile options**
+### Compile options
 
-```
-# fused-sdpa build (recommended, enables the fused SDPA path)
+```bash
 -march=armv8.6-a+dotprod+i8mm+sve -O3 -funroll-loops
 CFLAGS+=-DGGML_USE_FUSED_CPP_SDPA
 
-# standard build (matrix multiplication optimization only, no fused SDPA)
 -march=armv8.6-a+dotprod+i8mm+sve -O3 -funroll-loops
 ```
 
-**One-click build**
+### One-click build
 
 ```bash
-# Default build (-O3 RelWithDebInfo; builds ggml-cpu / llama-embedding / llama-bench / llama-server)
 ./compile.sh build-delivery
 ```
 
-**Environment variable control**
+### Environment variable control
 
 | Environment Variable | Value | Effect |
 | --- | --- | --- |

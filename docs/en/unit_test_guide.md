@@ -17,7 +17,7 @@ The test does not depend on model files or any external input: synthetic tensors
 
 Parameters `(B, H, L, S, D, DV, scale, mask)`:
 
-```
+```text
 B=1 H=2 L=8  S=8  D=32  DV=32  scale=0.125  mask=0
 B=1 H=2 L=8  S=8  D=32  DV=32  scale=0.125  mask=1
 B=2 H=4 L=6  S=10 D=64  DV=64  scale=0.088  mask=0
@@ -31,10 +31,11 @@ Covers multiple batches, multiple heads, and with/without mask; `DV` is always a
 ### 2.2 GEMM (14 cases)
 
 **GEMM shapes are taken from the linear layers of real embedding models:**
+
 - **bge-small-zh-v1.5**: `hidden=512, intermediate=2048` → attn Q/K/V/O `M=512,K=512`, ffn_up `M=2048,K=512`, ffn_down `M=512,K=2048`
 - **bge-m3**: `hidden=1024, intermediate=4096` → attn `M=1024,K=1024`, ffn_up `M=4096,K=1024`, ffn_down `M=1024,K=4096`
 
-```
+```text
 Weight type  M    N    K    Corresponding layer (model)
 f32        512    8  512  attn (bge-small)
 f16        512    8  512  attn (bge-small) → FP16 NEON GEMM
@@ -72,7 +73,7 @@ The test triggers the following optimized kernels (ARM/NEON) through the real gg
 3. A C++ reference implementation computes the expected results.
 4. Judge correctness with the normalized mean square error (NMSE):
 
-   ```
+   ```bash
    nmse(a, b) = Σ(a - b)² / Σa²
    ```
 
@@ -86,7 +87,7 @@ The test triggers the following optimized kernels (ARM/NEON) through the real gg
 
 `reference_matmul()` reproduces the `ggml_mul_mat` convention:
 
-```
+```bash
 out[i][j] = Σ_k w[i][k] · act[j][k]
 ```
 
@@ -121,8 +122,10 @@ ctest --test-dir build-delivery -R test-sdpa-f16q80-opt
 All cases passing returns 0; any failure returns 1.
 
 ## 6. Expected Output
+
 - `build-delivery/bin/test-sdpa-f16q80-opt`
-```
+
+```text
 === fused SDPA (GGML_OP_FUSED_CPP_SDPA_EXT) ===
   SDPA B=1 H=2 L=8 S=8 D=32 DV=32 mask=0 NMSE=6.010e-11 ok
   SDPA B=1 H=2 L=8 S=8 D=32 DV=32 mask=1 NMSE=7.238e-11 ok
@@ -149,8 +152,10 @@ All cases passing returns 0; any failure returns 1.
 
 === 0 cases failed ===
 ```
+
 - `ctest --test-dir build-delivery -L fused-sdpa`
-```
+
+```text
     Start 29: test-sdpa-f16q80-opt
 1/1 Test #29: test-sdpa-f16q80-opt .............   Passed    0.59 sec
 
@@ -161,8 +166,10 @@ fused-sdpa    =   0.59 sec*proc (1 test)
 
 Total Test time (real) =   0.60 sec
 ```
+
 - `ctest --test-dir build-delivery -R test-sdpa-f16q80-opt`
-```
+
+```text
     Start 29: test-sdpa-f16q80-opt
 1/1 Test #29: test-sdpa-f16q80-opt .............   Passed    0.62 sec
 
