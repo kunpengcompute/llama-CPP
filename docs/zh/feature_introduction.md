@@ -16,7 +16,7 @@ llama-CPP优化补丁基于官方llama.cpp（commit `3ac67535c86`）。本优化
 数据流如下。
 
 1. 应用层经`llama_eval()`进入推理循环，在框架层构建GGML计算图并由 `ggml_graph_compute()`调度。
-2. CPU Backend根据`vec_dot_type`选择优化kernel（F32/F16 `ops.cpp`中的matmul kernel 或fused SDPA入口）。
+2. CPU Backend根据`vec_dot_type`选择优化kernel。
 3. Q8_0 执行MMLA spack打包和tile计算，各kernel在底层利用SVE-256/NEON/i8mm指令完成 SIMD加速计算。
 
 ## FP16矩阵乘法优化
@@ -159,7 +159,7 @@ Q8_0 MatMul的调用流程如下。
 - 采用L3-cache-aware的KV分块策略。
 - fp32内部精度、pb16格式近似softmax。
 - 提供mask_f16/mask_f32/无mask三种变体，并按head分区到线程并行。
-- 实现位于`ggml/src/ggml-cpu/fused-cpp/fp32_packqkv/`，入口在`ops.cpp`，op定义在 `ggml.h`/`ggml.c`。
+- 实现位于`ggml/src/ggml-cpu/fused-cpp/fp32_packqkv/`，入口在`ops.cpp`，op定义在 `ggml.h`和`ggml.c`。
 
 ## 关键接口
 
@@ -201,7 +201,7 @@ void ggml_compute_forward_fused_cpp_sdpa_ext(const struct ggml_compute_params * 
 
 ### 编译选项
 
-- fused-sdpa编译（推荐，用于开启fused SDPA路径）
+- fused SDPA编译（推荐，用于开启fused SDPA路径）
 
 ```bash
 -march=armv8.6-a+dotprod+i8mm+sve -O3 -funroll-loops
@@ -230,11 +230,11 @@ CFLAGS+=-DGGML_USE_FUSED_CPP_SDPA
 
 ## 验收标准
 
-- 功能正确性：优化后各kernel输出与官方llama.cpp输出在指定测试数据集上的余弦相似度大于0.999，或C-MTEB所有数据集平均得分掉点小于1%，且通过精度验证脚本验证。
+- 功能正确性：优化后各kernel输出与官方llama.cpp输出在指定测试数据集上的余弦相似度大于0.999，或C-MTEB所有数据集平均得分掉点小于1%，且通过脚本实现精度验证。
 - 性能：各kernel优化后，在基准测试中端到端性能达成预期加速比（具体平台的性能数据参见《[技术报告](./technical_report.md)》）。
 
 ## 修订记录
 
 | 文档版本 | 发布日期 | 修改说明 |
 | :--- | :--- | :--- |
-| 01 | 2026-09-30 | 第一次正式发布。|
+| 01 | 2026-09-30 | 第一次正式发布 |
