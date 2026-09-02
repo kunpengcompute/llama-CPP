@@ -2,22 +2,22 @@
 
 ## 特性描述
 
-llama-CPP优化补丁基于官方llama.cpp（commit `3ac67535c86`）。本优化面向**鲲鹏950/鲲鹏920B**，利用ARM NEON/SVE-256/i8mm指令集，聚焦llama.cpp推理引擎CPU后端的矩阵乘法与注意力（SDPA）算子，覆盖FP16、FP32、Q8_0三种数据类型的矩阵乘法以及融合注意力计算。整体不修改上层API与计算图结构，通过GGML CPU Backend的 `type_traits` 回调注册机制替换底层kernel，保证与非优化路径完全兼容。优化补丁基于llama.cpp的计算图调度机制，在GGML CPU Backend中注入自研高性能kernel，覆盖FP16、FP32、Q8_0三种数据类型的矩阵乘法以及融合 SDPA（注意力）运算。
+llama-CPP优化补丁基于官方llama.cpp（commit `3ac67535c86`）。本优化面向**鲲鹏950处理器/鲲鹏920新型号处理器**，利用ARM NEON/SVE-256/i8mm指令集，聚焦llama.cpp推理引擎CPU后端的矩阵乘法与注意力（SDPA）算子，覆盖FP16、FP32、Q8_0三种数据类型的矩阵乘法以及融合注意力计算。整体不修改上层API与计算图结构，通过GGML CPU Backend的 `type_traits` 回调注册机制替换底层kernel，保证与非优化路径完全兼容。优化补丁基于llama.cpp的计算图调度机制，在GGML CPU Backend中注入自研高性能kernel，覆盖FP16、FP32、Q8_0三种数据类型的矩阵乘法以及融合SDPA（注意力）运算。
 
 ## 架构介绍
 
 | 层次 | 优化状态 | 关键组件 |
 | --- | --- | --- |
 | 应用层 | 未修改 | llama-embedding / llama-bench / llama-server |
-| 框架层 | 部分修改 | GGML OP IR（新增 GGML_OP_FUSED_CPP_SDPA_EXT）-&gt; type_traits matmul 路由 + fused SDPA op 分发 |
-| Kernel 层 | 全部新增 | FP16 / FP32 / Q8_0 MatMul + Fused SDPA（NEON / SVE / i8mm） |
-| 硬件层 | 未修改 | NEON、SVE-256（256-bit）、i8mm；OpenMP 并行；64B 对齐内存 |
+| 框架层 | 部分修改 | GGML OP IR（新增GGML_OP_FUSED_CPP_SDPA_EXT）-&gt; type_traits matmul路由+fused SDPA op分发 |
+| Kernel 层 | 全部新增 | FP16/FP32/Q8_0 MatMul+Fused SDPA（NEON/SVE/i8mm） |
+| 硬件层 | 未修改 | NEON、SVE-256（256-bit）、i8mm；OpenMP并行；64B对齐内存 |
 
 数据流如下。
 
-- 应用层经`llama_eval()`进入推理循环，在框架层构建GGML计算图并由 `ggml_graph_compute()`调度。
-- CPU Backend根据`vec_dot_type`选择优化kernel（F32/F16 `ops.cpp`中的matmul kernel 或fused SDPA入口）。
-- Q8_0 执行MMLA spack打包和tile计算，各kernel在底层利用SVE-256/NEON/i8mm指令完成 SIMD加速计算。
+1. 应用层经`llama_eval()`进入推理循环，在框架层构建GGML计算图并由 `ggml_graph_compute()`调度。
+2. CPU Backend根据`vec_dot_type`选择优化kernel。
+3. Q8_0 执行MMLA spack打包和tile计算，各kernel在底层利用SVE-256/NEON/i8mm指令完成 SIMD加速计算。
 
 ## FP16矩阵乘法优化
 
@@ -56,7 +56,7 @@ Embedding模型在权重为F16时，矩阵乘法主要发生在prefill阶段，�
 输入：`packA(预打包A)[M_packed, K]`、`B[N,K]`（fp16）；约束设置为 `M%16==0`、`N%8==0`。
 
 1. 主循环 (N按8, M按16)：初始化16个NEON累加器 (v12..v27)。
-2. K主循环(step=32, 双 block)：
+2. K主循环(step=32, 双block)：
    - 加载16×2个A vector（从packA中）、8个B vector。
    - 每个B向量lane广播乘16个A vector -&gt; 8×16=128次fmla（step=32共256次）。
 3. K全块尾循环(step=16)；K标量尾循环(step=2)。
@@ -126,11 +126,11 @@ Q8_0 MatMul的调用流程如下。
 
 ## Fused SDPA（FlashAttention v2 NEON融合算子）
 
-官方llama.cpp Attention由 QKᵀ、缩放、Mask、Softmax、PV等多个独立算子依次完成。中间 scores矩阵被反复读写，CPU上易从“算力瓶颈”变为“L2/L3/内存带宽瓶颈”。Fused SDPA将这些步骤融合进一个专用C++/NEON/SVE kernel，按tile流式完成，减少中间张量与内存流量。
+官方llama.cpp Attention由QKᵀ、缩放、Mask、Softmax、PV等多个独立算子依次完成。中间 scores矩阵被反复读写，CPU上易从“算力瓶颈”变为“L2/L3/内存带宽瓶颈”。Fused SDPA将这些步骤融合进一个专用C++/NEON/SVE kernel，按tile流式完成，减少中间张量与内存流量。
 
 ### 集成方式
 
-通过`GGML_USE_FUSED_CPP_SDPA`编译宏控制。`llama-graph.cpp`的 `build_attn_mha()` 检测启用条件如下。
+通过`GGML_USE_FUSED_CPP_SDPA`编译宏控制。`llama-graph.cpp`的`build_attn_mha()`检测启用条件如下。
 
 - ARM64平台；q/k/v均为F32；MHA（n_head==n_head_kv）。
 - 无MLA、无ALiBi、无attn_soft_cap。
@@ -143,9 +143,9 @@ Q8_0 MatMul的调用流程如下。
 推理流程如下。
 
 1. `build_attn_mha()`判断是否使用fused SDPA路径。
-2. 当满足启用条件时，构建`GGML_OP_FUSED_CPP_SDPA_EXT`算子并调用`ggml_fused_cpp_sdpa_ext(q, k, v, mask, scale)`，经`ops.cpp`中的`ggml_compute_forward_fused_cpp_sdpa_ext()`执行：
+2. 当满足启用条件时，构建`GGML_OP_FUSED_CPP_SDPA_EXT`算子并调用`ggml_fused_cpp_sdpa_ext(q, k, v, mask, scale)`，经`ops.cpp`中的`ggml_compute_forward_fused_cpp_sdpa_ext()`执行以下内容。
    - 当L等于S且L能被64整除时，采用对角分块（64×64 blocks，只计算因果上三角）。
-   - 否则，全矩阵调用`fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp()`。
+   - 否则，全矩阵调用。`fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp()`。
 3. 当不满足启用条件时，回退到官方flash_attn（flash_attn_ext）。
 
 ### 对角分块优化
@@ -159,7 +159,7 @@ Q8_0 MatMul的调用流程如下。
 - 采用L3-cache-aware的KV分块策略。
 - fp32内部精度、pb16格式近似softmax。
 - 提供mask_f16/mask_f32/无mask三种变体，并按head分区到线程并行。
-- 实现位于`ggml/src/ggml-cpu/fused-cpp/fp32_packqkv/`，入口在`ops.cpp`，op定义在 `ggml.h`/`ggml.c`。
+- 实现位于`ggml/src/ggml-cpu/fused-cpp/fp32_packqkv/`，入口在`ops.cpp`，op定义在 `ggml.h`和`ggml.c`。
 
 ## 关键接口
 
@@ -201,14 +201,14 @@ void ggml_compute_forward_fused_cpp_sdpa_ext(const struct ggml_compute_params * 
 
 ### 编译选项
 
-- fused-sdpa编译（推荐，用于开启fused SDPA路径）
+- fused SDPA编译（推荐，用于开启fused SDPA路径）
 
 ```bash
 -march=armv8.6-a+dotprod+i8mm+sve -O3 -funroll-loops
 CFLAGS+=-DGGML_USE_FUSED_CPP_SDPA
 ```
 
-- 标准编译（仅矩阵乘法优化，不包含 fused SDPA）
+- 标准编译（仅矩阵乘法优化，不包含fused SDPA）
 
 ```bash
 -march=armv8.6-a+dotprod+i8mm+sve -O3 -funroll-loops
@@ -230,11 +230,11 @@ CFLAGS+=-DGGML_USE_FUSED_CPP_SDPA
 
 ## 验收标准
 
-- 功能正确性：优化后各kernel输出与官方llama.cpp输出在指定测试数据集上的余弦相似度大于0.999，或C-MTEB所有数据集平均得分掉点小于1%，且通过精度验证脚本验证。
+- 功能正确性：优化后各kernel输出与官方llama.cpp输出在指定测试数据集上的余弦相似度大于0.999，或C-MTEB所有数据集平均得分掉点小于1%，且通过脚本实现精度验证。
 - 性能：各kernel优化后，在基准测试中端到端性能达成预期加速比（具体平台的性能数据参见《[技术报告](./technical_report.md)》）。
 
 ## 修订记录
 
-| 发布日期 | 修订记录 |
-| :--- | :--- |
-| 2026-08-24 | 第一次正式发布。<br>- 统一llama.cpp相关描述为官方llama.cpp（commit `3ac67535c86`）。<br>- 处理器名称统一为鲲鹏950/鲲鹏920B。<br>- 将分块策略、推理流程与调用链等改为有序列表文字描述。<br>- 修正与Markdown链接冲突的方括号表达式，并将特殊箭头符号替换为`-&gt;`。 |
+| 文档版本 | 发布日期 | 修改说明 |
+| :--- | :--- | :--- |
+| 01 | 2026-09-30 | 第一次正式发布 |

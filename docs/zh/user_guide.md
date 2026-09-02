@@ -2,11 +2,11 @@
 
 ## 调优概述
 
-本文档基于鲲鹏950/鲲鹏920B平台，提供针对官方llama.cpp（commit `3ac67535c86`）合入优化补丁、编译、部署并运行 bge-m3 等 Embedding 模型的调优指导步骤。
+本文档基于鲲鹏950处理器/鲲鹏920新型号处理器，提供针对官方llama.cpp（commit `3ac67535c86`）合入优化补丁、编译、部署并运行bge-m3等Embedding模型的调优指导步骤。
 
 ## 环境要求
 
-- 硬件平台：鲲鹏950/鲲鹏920B（NEON / SVE-256 / i8mm）
+- 硬件平台：鲲鹏950处理器/鲲鹏920新型号处理器（NEON / SVE-256 / i8mm）
 - 操作系统：openEuler 22.03 LTS SP3
 - 编译器：GCC/G++ 15.2.0或更新版本（需支持 `armv8.6-a+dotprod+i8mm+sve`）
 - 构建依赖：cmake >= 3.20、ninja（推荐）、git
@@ -14,7 +14,7 @@
 
 ## 适配优化补丁
 
-本优化补丁基于官方llama.cpp（commit `3ac67535c86`），与镜像`swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/llama.cpp:920B-kunpeng`中的commit 版本一致。
+本优化补丁基于官方llama.cpp（commit `3ac67535c86`）。
 
 1. 拉取代码，此处以`/home/code`为例。
 
@@ -30,9 +30,9 @@
    git am /home/code/llama-CPP/patch/00*.patch
    ```
 
-## 编译
+## 编译优化补丁
 
-使用`compile.sh`一键编译（`compile.sh` 由补丁`0009`、`0010`一并引入）。
+使用`compile.sh`一键编译（`compile.sh`由补丁`0009`、`0010`一并引入）。
 
 ```bash
 ./compile.sh build-delivery
@@ -123,7 +123,7 @@ python eval_llamacpp_cmteb.py \
 
 >**说明：**
 >
->- servers后面以`server_name>=<server url`设置llama server，使用空格分离多个server。
+>- servers后面以`<server_name>=<server url>`设置llama server，使用空格分离多个server。
 >- server-workers数量等于上面的server数量，测试几个server就用几个worker。
 >- cmteb-root改成自己的C-MTEB数据集路径。
 >- 如果Task的分数是NaN，可以再重新运行该Task。
@@ -134,4 +134,4 @@ python eval_llamacpp_cmteb.py \
 
 | 发布日期 | 修订记录 |
 | :--- | :--- |
-| 2026-08-24 | 第一次正式发布。<br>- 统一llama.cpp相关描述为官方llama.cpp（commit `3ac67535c86`）。<br>- 处理器名称统一为鲲鹏950/鲲鹏920B，并移除处理器示例表述。 |
+| 2026-08-24 | 第一次正式发布。 |

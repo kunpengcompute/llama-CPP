@@ -5,9 +5,9 @@
 `tests/test-sdpa-f16q80-opt`是基于合成（mock）数据的正确性单元测试，用于验证两条推理路径。
 
 | 路径 | ggml 算子 |
-|------|-----------|
-| 融合注意力（SDPA） | `GGML_OP_FUSED_CPP_SDPA_EXT`（`ggml_fused_cpp_sdpa_ext`）|
-| 矩阵乘（GEMM）   | `ggml_mul_mat`（F32/F16/Q8_0权重）                       |
+| ------ | ----------- |
+| 融合注意力（SDPA） | `GGML_OP_FUSED_CPP_SDPA_EXT`（`ggml_fused_cpp_sdpa_ext`） |
+| 矩阵乘（GEMM） | `ggml_mul_mat`（F32/F16/Q8_0权重） |
 
 测试不依赖模型文件或任何外部输入：进程内生成合成张量，经真实ggml CPU计算图执行端到端推理，并与C++数学参考实现比对。
 
@@ -53,12 +53,11 @@ q8_0   1024    8 4096  ffn_down（bge-m3）-> Q8_0 NEON GEMM
 
 ### 2.3 测试涉及的关键路径函数
 
-测试通过真实ggml`mul_mat`/融合SDPA dispatch触发以下优化内核（ARM/NEON），确保
-**FP16 GEMM NEON 算子**与 **Q8_0 GEMM NEON 算子**被实际执行并验证。
+测试通过真实ggml`mul_mat`/融合SDPA dispatch触发以下优化内核（ARM/NEON），确保**FP16 GEMM NEON 算子**与 **Q8_0 GEMM NEON 算子**被实际执行并验证。
 
 | 路径 | 涉及函数 |
 | ------ | ---------- |
-| F16 GEMM（NEON） | `matmul_outer_packA_b_g_b16` -&gt; `matmul_outer_8x16_b_micro_packA_f16` / `matmul_outer_4x16_b_micro_packA_f16`；leftover 走 `ggml_matmul_f16_4x4_kernel` |
+| F16 GEMM（NEON） | `matmul_outer_packA_b_g_b16` -&gt; `matmul_outer_8x16_b_micro_packA_f16` / `matmul_outer_4x16_b_micro_packA_f16`；leftover走`ggml_matmul_f16_4x4_kernel` |
 | Q8_0 GEMM（NEON） | `matmul_q8_0_mmla_spack_b_g` -&gt; `matmul_q8_0_mmla_8x8_b_micro_spack_neon` / `matmul_q8_0_mmla_4x4_b_micro_spack_neon` |
 | F32 GEMM | `ggml_matmul_f32_4x4_kernel` |
 | 融合 SDPA | `ggml_compute_forward_fused_cpp_sdpa_ext` -&gt; `fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp` / `..._mask_f16` / `..._mask_f32` |
@@ -67,12 +66,12 @@ q8_0   1024    8 4096  ffn_down（bge-m3）-> Q8_0 NEON GEMM
 
 ## 3. 测试原理
 
-测试用带种子的伪随机函数生成可复现的合成数据，将数据写入ggml张量，构建计算图并在CPU后端执行，再由C++参考实现计算期望结果，最后以归一化均方误差（NMSE，`nmse(a, b) = Σ(a - b)² / Σa²`）判定结果是否正确。判定阈值如下：fused SDPA `NMSE < 1e-4`；GEMM按权重类型区分，F32/Q8_0 `NMSE < 1e-4`，F16 `NMSE < 5e-3`（FP16累加精度随K增大而降低，故F16阈值放宽）。
+测试用带种子的伪随机函数生成可复现的合成数据，将数据写入ggml张量，构建计算图并在CPU后端执行。再由C++参考实现计算期望结果，最后以归一化均方误差（NMSE，`nmse(a, b) = Σ(a - b)² / Σa²`）判定结果是否正确。判定阈值如下：fused SDPA `NMSE < 1e-4`；GEMM按权重类型区分，F32/Q8_0 `NMSE < 1e-4`，F16 `NMSE < 5e-3`（FP16累加精度随K增大而降低，故F16阈值放宽）。
 
 ### 3.1 SDPA参考
 
 1. `reference_sdpa()`复现`out = softmax(scale · Q·Kᵀ + mask) · V`。
-2. q/k/v/out 按 ggml张量`ne`的连续内存索引访问（innermost=`ne[0]`）。
+2. q/k/v/out按ggml张量`ne`的连续内存索引访问（innermost=`ne[0]`）。
 3. mask按`[L, S]`布局（`mask[l*S + s]`）叠加。
 
 ### 3.2 GEMM参考
@@ -172,6 +171,6 @@ Total Test time (real) =   0.62 sec
 
 ## 修订记录
 
-| 发布日期 | 修订记录 |
-| :--- | :--- |
-| 2026-08-24 | 第一次正式发布。<br>- 将测试原理的有序描述调整为段落描述，避免被误认为操作步骤。<br>- 将特殊箭头符号替换为`-&gt;`。 |
+| 文档版本 | 发布日期 | 修改说明 |
+| :--- | :--- | :--- |
+| 01 | 2026-09-30 | 第一次正式发布。 |

@@ -1,10 +1,10 @@
 # 快速入门
 
-本文介绍如何基于官方llama.cpp（commit `3ac67535c86`）checkout代码、合入优化补丁并完成编译，快速体验llama-CPP在鲲鹏950/鲲鹏920B上提供的CPU算子优化能力。优化补丁聚焦FP16/FP32/Q8_0矩阵乘法与fused SDPA注意力算子，可提升llama.cpp在CPU小模型推理场景下的性能。
+本文介绍如何基于官方llama.cpp（commit `3ac67535c86`）checkout代码、合入优化补丁并完成编译，使用户快速体验llama-CPP在鲲鹏950处理器/鲲鹏920新型号处理器上提供的CPU算子优化能力。优化补丁聚焦FP16/FP32/Q8_0矩阵乘法与fused SDPA注意力算子，可提升llama.cpp在CPU小模型推理场景下的性能。
 
 ## 环境要求
 
-- 硬件平台：鲲鹏950/鲲鹏920B（NEON / SVE-256 / i8mm）
+- 硬件平台：鲲鹏950处理器/鲲鹏920新型号处理器（NEON / SVE-256 / i8mm）
 - 操作系统：openEuler 22.03 LTS SP3
 - 编译器：GCC/G++ 15.2.0或更新版本（需支持`armv8.6-a+dotprod+i8mm+sve`）
 - 构建依赖：cmake >= 3.20、ninja（推荐）、git
@@ -72,6 +72,6 @@ build-delivery/bin/test-sdpa-f16q80-opt
 
 ## 修订记录
 
-| 发布日期 | 修订记录 |
-| :--- | :--- |
-| 2026-08-24 | 第一次正式发布。<br>- 新增本文档，提供基于官方llama.cpp（commit `3ac67535c86`）checkout代码、合入优化补丁与编译的快速入门指引。 |
+| 文档版本 | 发布日期 | 修改说明 |
+| :--- | :--- | :--- |
+| 01 | 2026-09-30 | 第一次正式发布。 |

@@ -4,11 +4,11 @@
 
 ## 最新消息
 
-- [2026.09.30]：面向鲲鹏950/鲲鹏920B，发布针对官方llama.cpp（commit `3ac67535c86`）的CPU算子优化补丁合集，聚焦FP16 / FP32 / Q8_0矩阵乘法与融合SDPA注意力算子。
+- [2026.09.30]：面向鲲鹏950处理器/鲲鹏920新型号处理器，发布针对官方llama.cpp（commit `3ac67535c86`）的CPU算子优化补丁合集，聚焦FP16/FP32/Q8_0矩阵乘法与融合SDPA注意力算子。
 
 ## 项目介绍
 
-llama-CPP是针对鲲鹏950/鲲鹏920B进行的CPU小模型推理性能优化，聚焦llama.cpp推理引擎CPU后端的ARM矩阵乘法与注意力（SDPA）算子，采用ARM NEON/SVE-256/i8mm指令集充分释放鲲鹏950/鲲鹏920B的算力，提升矩阵乘法和注意力计算性能。本项目针对官方llama.cpp输出优化补丁。
+llama-CPP是针对鲲鹏950处理器/鲲鹏920新型号处理器进行的CPU小模型推理性能优化，聚焦llama.cpp推理引擎CPU后端的ARM矩阵乘法与注意力（SDPA）算子，采用ARM NEON/SVE-256/i8mm指令集充分释放鲲鹏950处理器/鲲鹏920新型号处理器的算力，提升矩阵乘法和注意力计算性能。本项目针对官方llama.cpp输出优化补丁。
 
 优化能力主要包括：FP16/FP32/Q8_0三种数据类型的矩阵乘法kernel、Fused SDPA（FlashAttention v2 NEON融合算子）以及针对官方llama.cpp的若干功能性修复。
 
@@ -39,6 +39,7 @@ llama-CPP/
 │   │   ├── unit_test_guide.md                    # 单元测试指南
 │   │   ├── technical_report.md                   # 技术报告
 │   └── en                                        # English document directory
+│       ├── menu_llamacpp.md                      # 英文文档导航
 │       ├── feature_introduction.md               # feature_introduction
 │       ├── release_notes.md                      # release_notes
 │       ├── user_guide.md                         # user_guide
