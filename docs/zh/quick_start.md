@@ -5,8 +5,8 @@
 ## 环境要求
 
 - 硬件平台：鲲鹏950处理器/鲲鹏920新型号处理器（NEON / SVE-256 / i8mm）
-- 操作系统：openEuler 22.03 LTS SP3
-- 编译器：GCC/G++ 15.2.0或更新版本（需支持`armv8.6-a+dotprod+i8mm+sve`）
+- 操作系统：openEuler 22.03 LTS SP3及以上版本
+- 编译器：GCC/G++ 12.3.1或更新版本（需支持`armv8.6-a+dotprod+i8mm+sve`）
 - 构建依赖：cmake >= 3.20、ninja（推荐）、git
 
 ## 1. 获取代码并checkout到对应commit
@@ -45,7 +45,7 @@ llama-CPP优化补丁位于仓库`patch/`目录下的`0001`至`0011`补丁文件
 
 ## 3. 编译
 
-使用`compile.sh`一键编译（`compile.sh`由补丁`0009`、`0010`一并引入）。
+使用`compile.sh`一键编译。
 
 ```bash
 ./compile.sh build-delivery
