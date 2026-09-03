@@ -7,8 +7,8 @@
 ## 环境要求
 
 - 硬件平台：鲲鹏950处理器/鲲鹏920新型号处理器（NEON / SVE-256 / i8mm）
-- 操作系统：openEuler 22.03 LTS SP3
-- 编译器：GCC/G++ 15.2.0或更新版本（需支持 `armv8.6-a+dotprod+i8mm+sve`）
+- 操作系统：openEuler 22.03 LTS SP3及以上版本
+- 编译器：GCC/G++ 12.3.1或更新版本（需支持`armv8.6-a+dotprod+i8mm+sve`）
 - 构建依赖：cmake >= 3.20、ninja（推荐）、git
 - 模型选择：bge-m3、bge-small-zh-v1.5等Embedding模型（FP16/Q8_0 GGUF格式）
 
@@ -110,10 +110,10 @@ python bench_bgem3_full.py
 
 ```bash
 python eval_llamacpp_cmteb.py \
---servers baseline=http://141.61.21.62:8080 opt=http://141.61.21.62:7080 \
+--servers baseline=http://<ip>:<port> opt=<ip>:<port> \
 --server-workers 2 \
 --task-names   TNews IFlyTek MultilingualSentiment JDReview OnlineShopping Waimai     CLSClusteringS2S.v2 CLSClusteringP2P.v2 ThuNewsClusteringS2S.v2 ThuNewsClusteringP2P.v2     Ocnli Cmnli     T2Reranking MMarcoReranking CMedQAv1-reranking CMedQAv2-reranking     ATEC BQ LCQMC PAWSX STSB AFQMC QBQTC   \
---cmteb-root /home/l30061571/models/datasets/C-MTEB \
+--cmteb-root /path/to/C-MTEB \
 --batch-size 1 \
 --max-chars 500 \
 --skip-bad-embedding \
