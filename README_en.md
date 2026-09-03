@@ -75,7 +75,7 @@ The Chinese technical report and detailed design document are also available und
 1. Clone the `master` branch of this repository:
 
    ```shell
-   git clone https://gitcode.com/wangyan575757/llama-CPP.git
+   git clone https://gitcode.com/boostkit/llama-CPP.git
    cd llama-CPP
    ```
 

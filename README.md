@@ -75,7 +75,7 @@ llama-CPP本身的版本说明，具体请参见《[版本说明书](https://git
 1. 拉取本仓库 master 分支源码：
 
    ```shell
-   git clone https://gitcode.com/wangyan575757/llama-CPP.git
+   git clone https://gitcode.com/boostkit/llama-CPP.git
    cd llama-CPP
    ```
 
