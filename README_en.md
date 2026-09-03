@@ -127,9 +127,4 @@ The documents of this project are licensed under CC-BY 4.0.
 
 ## Acknowledgments
 
-llama-CPP is jointly developed by the following Huawei department:
-
-Kunpeng Computing BoostKit Development Dept
-Computing Technology Development Dept
-
 Thank you to everyone in the community for your PRs. We warmly welcome contributions to llama-CPP!
