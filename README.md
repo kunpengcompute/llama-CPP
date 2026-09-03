@@ -75,7 +75,7 @@ llama-CPP本身的版本说明，具体请参见《[版本说明书](https://git
 1. 拉取本仓库 master 分支源码：
 
    ```shell
-   git clone https://gitcode.com/wangyan575757/llama-CPP.git
+   git clone https://gitcode.com/boostkit/llama-CPP.git
    cd llama-CPP
    ```
 
@@ -126,10 +126,5 @@ llama-CPP本身的版本说明，具体请参见《[版本说明书](https://git
 本项目文档适用CC-BY 4.0许可证。
 
 ## 致谢
-
-llama-CPP由华为公司的下列部门联合贡献：
-
-鲲鹏计算Boostkit开发部
-计算技术开发部
 
 感谢来自社区的每一个PR，欢迎贡献llama-CPP！

@@ -75,7 +75,7 @@ The Chinese technical report and detailed design document are also available und
 1. Clone the `master` branch of this repository:
 
    ```shell
-   git clone https://gitcode.com/wangyan575757/llama-CPP.git
+   git clone https://gitcode.com/boostkit/llama-CPP.git
    cd llama-CPP
    ```
 
@@ -126,10 +126,5 @@ The upstream llama.cpp code is released under the MIT License; see [LICENSE](./L
 The documents of this project are licensed under CC-BY 4.0.
 
 ## Acknowledgments
-
-llama-CPP is jointly developed by the following Huawei department:
-
-Kunpeng Computing BoostKit Development Dept
-Computing Technology Development Dept
 
 Thank you to everyone in the community for your PRs. We warmly welcome contributions to llama-CPP!
