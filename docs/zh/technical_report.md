@@ -12,15 +12,15 @@
 
  ```shell
  python eval_llamacpp_cmteb.py \
- --servers baseline=http://141.61.21.62:8080 opt=http://141.61.21.62:7080 \
- --server-workers 2 \
- --task-names   TNews IFlyTek MultilingualSentiment JDReview OnlineShopping Waimai     CLSClusteringS2S.v2 CLSClusteringP2P.v2 ThuNewsClusteringS2S.v2 ThuNewsClusteringP2P.v2     Ocnli Cmnli     T2Reranking MMarcoReranking CMedQAv1-reranking CMedQAv2-reranking     ATEC BQ LCQMC PAWSX STSB AFQMC QBQTC   \
- --cmteb-root /home/l30061571/models/datasets/C-MTEB \
- --batch-size 1 \
- --max-chars 500 \
- --skip-bad-embedding \
- --output-dir ./f16-all \
- --continue-on-error
+--servers baseline=http://<ip>:<port> opt=<ip>:<port> \
+--server-workers 2 \
+--task-names   TNews IFlyTek MultilingualSentiment JDReview OnlineShopping Waimai     CLSClusteringS2S.v2 CLSClusteringP2P.v2 ThuNewsClusteringS2S.v2 ThuNewsClusteringP2P.v2     Ocnli Cmnli     T2Reranking MMarcoReranking CMedQAv1-reranking CMedQAv2-reranking     ATEC BQ LCQMC PAWSX STSB AFQMC QBQTC   \
+--cmteb-root /path/to/C-MTEB \
+--batch-size 1 \
+--max-chars 500 \
+--skip-bad-embedding \
+--output-dir ./f16-all \
+--continue-on-error
  ```
 
 >**说明:**

@@ -157,7 +157,7 @@ Q8_0 MatMul的调用流程如下。
 - Q/K/V在微内核内完成。
 - pack+transpose，避免额外内存移动。
 - 采用L3-cache-aware的KV分块策略。
-- fp32内部精度、pb16格式近似softmax。
+- fp32内部精度、pb16格式近似softmax（pb16指 "packed bfloat16"）。
 - 提供mask_f16/mask_f32/无mask三种变体，并按head分区到线程并行。
 - 实现位于`ggml/src/ggml-cpu/fused-cpp/fp32_packqkv/`，入口在`ops.cpp`，op定义在 `ggml.h`和`ggml.c`。
 
