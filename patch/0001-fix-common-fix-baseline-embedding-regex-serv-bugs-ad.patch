@@ -1,4 +1,4 @@
-From 8b639de1dbab6baee353fdbbcaa6e1cdfd6d1e22 Mon Sep 17 00:00:00 2001
+From ccab06d5c19378e4b1eebc8ceb0b76d1e05d5327 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:18:45 +0800
 Subject: [PATCH 01/11] fix(common): fix baseline embedding/regex serv bugs,
@@ -326,6 +326,3 @@ index f3e0392a..6e40a33e 100644
      void keep_first(size_t n) {
          GGML_ASSERT(n <= tokens.size());
          if (has_mtmd) {
--- 
-2.43.0
-

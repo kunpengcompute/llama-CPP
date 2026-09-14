@@ -1,4 +1,4 @@
-From fec0f0f0ab62363aa452e30c132f75541907ad60 Mon Sep 17 00:00:00 2001
+From 81c72671f3e344918b07375bf027da8d58b09d4d Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:20:24 +0800
 Subject: [PATCH 09/11] build: add compile.sh helper for ARM builds
@@ -38,6 +38,3 @@ index 00000000..cec41977
 +    ;;
 +esac
 +cmake --build $1 --config release --target ggml-cpu llama-embedding llama-bench llama-server -j 20 
--- 
-2.43.0
-

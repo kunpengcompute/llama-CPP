@@ -143,14 +143,8 @@ Q8_0 MatMul的调用流程如下。
 推理流程如下。
 
 1. `build_attn_mha()`判断是否使用fused SDPA路径。
-2. 当满足启用条件时，构建`GGML_OP_FUSED_CPP_SDPA_EXT`算子并调用`ggml_fused_cpp_sdpa_ext(q, k, v, mask, scale)`，经`ops.cpp`中的`ggml_compute_forward_fused_cpp_sdpa_ext()`执行以下内容。
-   - 当L等于S且L能被64整除时，采用对角分块（64×64 blocks，只计算因果上三角）。
-   - 否则，全矩阵调用。`fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp()`。
+2. 当满足启用条件时，构建`GGML_OP_FUSED_CPP_SDPA_EXT`算子并调用`ggml_fused_cpp_sdpa_ext(q, k, v, mask, scale)`，经`ops.cpp`中的`ggml_compute_forward_fused_cpp_sdpa_ext()`全矩阵调用`fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp()`。
 3. 当不满足启用条件时，回退到官方flash_attn（flash_attn_ext）。
-
-### 对角分块优化
-
-当`L == S`（prefill）且`L % 64 == 0`时，把注意力矩阵沿对角线划分为64×64块，只计算因果mask内上三角块，减少计算量。
 
 ### NEON kernel
 

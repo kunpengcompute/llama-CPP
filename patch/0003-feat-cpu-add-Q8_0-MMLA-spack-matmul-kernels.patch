@@ -1,4 +1,4 @@
-From 76b5a66ffea772ed1613bf452b876879cb8fc8a9 Mon Sep 17 00:00:00 2001
+From 6b24aa52505d3a4bec9b1db466660238e42f5a16 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:19:07 +0800
 Subject: [PATCH 03/11] feat(cpu): add Q8_0 MMLA spack matmul kernels
@@ -1997,6 +1997,3 @@ index e33d9d47..04fb648d 100644
  #ifdef __cplusplus
  }
  #endif
--- 
-2.43.0
-
