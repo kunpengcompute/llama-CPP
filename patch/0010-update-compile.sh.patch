@@ -1,4 +1,4 @@
-From c5b1801522db216c48f8e858cfd817818ceba4df Mon Sep 17 00:00:00 2001
+From c375392514fab0c438f86e5447942cd4855c4e69 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Fri, 7 Aug 2026 09:09:34 +0800
 Subject: [PATCH 10/11] update compile.sh

@@ -1,4 +1,4 @@
-From a9624c1d5c7d3c9c1c69c6bc9cd78aa9a2d5e544 Mon Sep 17 00:00:00 2001
+From 1f71fc565c5576ca03e4a03c6a2470e33e5b6359 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:20:06 +0800
 Subject: [PATCH 07/11] feat(llama): add GGML fused SDPA op and integrate into
@@ -7,7 +7,7 @@ Subject: [PATCH 07/11] feat(llama): add GGML fused SDPA op and integrate into
 - ggml.h / ggml.c: new GGML_OP_FUSED_CPP_SDPA_EXT op + ggml_fused_cpp_sdpa_ext()
   (F32 q/k/v optional F16/F32 mask, MHA only)
 - ops.h/ops.cpp: ggml_compute_forward_fused_cpp_sdpa_ext with head-level
-  thread partitioning and 64x64 diagonal-block path for L==S
+  thread partitioning; full LxS kernel covers L==S
 - ggml-cpu/CMakeLists.txt: ARM build wires fused-cpp sources under
   GGML_USE_FUSED_CPP_SDPA
 - llama-graph.cpp/h: build_attn_mha picks the fused SDPA path on aarch64
