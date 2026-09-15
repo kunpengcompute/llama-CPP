@@ -1,4 +1,4 @@
-From ccab06d5c19378e4b1eebc8ceb0b76d1e05d5327 Mon Sep 17 00:00:00 2001
+From 11c50f0d59735eca9c417feec559701666ec5d76 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:18:45 +0800
 Subject: [PATCH 01/11] fix(common): fix baseline embedding/regex serv bugs,

@@ -1,4 +1,4 @@
-From 1d3c91082476e4856e461f04e80efc6f54af2179 Mon Sep 17 00:00:00 2001
+From 4e02a0da109cbc96641695829f328579116a4d36 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:18:57 +0800
 Subject: [PATCH 02/11] feat(cpu): add ARM SVE/NEON FP16 & FP32 matmul kernels

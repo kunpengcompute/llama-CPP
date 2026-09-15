@@ -1,12 +1,12 @@
-From 0b18991461db729ed4c3f89e077144c6a785f82a Mon Sep 17 00:00:00 2001
+From 9d76a7f4eddb18d4f53cd7f4c42ea89b9caa782f Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 13 Aug 2026 14:17:45 +0800
 Subject: [PATCH 11/11] add f16/q80 unit test
 
 ---
  tests/CMakeLists.txt           |   9 +
- tests/test-sdpa-f16q80-opt.cpp | 330 +++++++++++++++++++++++++++++++++
- 2 files changed, 339 insertions(+)
+ tests/test-sdpa-f16q80-opt.cpp | 382 +++++++++++++++++++++++++++++++++
+ 2 files changed, 391 insertions(+)
  create mode 100644 tests/test-sdpa-f16q80-opt.cpp
 
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
@@ -31,10 +31,10 @@ index 83f7d1a4..84fb4857 100644
  
 diff --git a/tests/test-sdpa-f16q80-opt.cpp b/tests/test-sdpa-f16q80-opt.cpp
 new file mode 100644
-index 00000000..7167f8b3
+index 00000000..9d3fa8a6
 --- /dev/null
 +++ b/tests/test-sdpa-f16q80-opt.cpp
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,382 @@
 +// Unit test for the fused SDPA operator (GGML_OP_FUSED_CPP_SDPA_EXT) and the
 +// F16 / F32 / Q8_0 GEMM matmul path (ggml_mul_mat) using synthetic (mock) inputs.
 +//
@@ -144,7 +144,7 @@ index 00000000..7167f8b3
 +static std::vector<float> run_fused_sdpa(const float * q, const float * k,
 +        const float * v, const float * mask,
 +        int64_t B, int64_t H, int64_t L, int64_t S, int64_t D, int64_t DV,
-+        float scale, int n_threads) {
++        float scale, int n_threads, bool mask_f16 = false) {
 +    const size_t qnb = (size_t) D * L * H * B * sizeof(float);
 +    const size_t knb = (size_t) D * S * H * B * sizeof(float);
 +    const size_t vnb = (size_t) DV * S * H * B * sizeof(float);
@@ -160,15 +160,23 @@ index 00000000..7167f8b3
 +    ggml_tensor * kk = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, S, H, B);
 +    ggml_tensor * vv = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, DV, S, H, B);
 +    ggml_tensor * mm = nullptr;
++    std::vector<ggml_fp16_t> mask16;
 +    if (mask != nullptr) {
-+        mm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, L);
++        mm = ggml_new_tensor_2d(ctx, mask_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, S, L);
++        if (mask_f16) {
++            mask16.resize((size_t) S * L);
++            const size_t n = (size_t) S * L;
++            for (size_t i = 0; i < n; i++) {
++                mask16[i] = ggml_fp32_to_fp16(mask[i]);
++            }
++        }
 +    }
 +
 +    memcpy(qq->data, q, ggml_nbytes(qq));
 +    memcpy(kk->data, k, ggml_nbytes(kk));
 +    memcpy(vv->data, v, ggml_nbytes(vv));
 +    if (mm != nullptr) {
-+        memcpy(mm->data, mask, ggml_nbytes(mm));
++        memcpy(mm->data, mask_f16 ? (const void *) mask16.data() : (const void *) mask, ggml_nbytes(mm));
 +    }
 +
 +    ggml_tensor * out = ggml_fused_cpp_sdpa_ext(ctx, qq, kk, vv, mm, scale);
@@ -340,6 +348,45 @@ index 00000000..7167f8b3
 +               (long long)D, (long long)DV, err, RESULT_STR[!ok]);
 +        failures += !ok;
 +    }
++    // F16 mask path (coverage for ..._mask_f16 wrapper)
++    {
++        const int64_t B = 1, H = 2, L = 256, S = 256, D = 64, DV = 64;
++        std::vector<float> q(B*H*L*D), k(B*H*S*D), v(B*H*S*DV), mask(S*L);
++        fill_float(q.data(), q.size(), -1, 1, 101);
++        fill_float(k.data(), k.size(), -1, 1, 202);
++        fill_float(v.data(), v.size(), -1, 1, 303);
++        fill_float(mask.data(), mask.size(), -2, 0, 404);
++        std::vector<float> ref(B*H*L*DV);
++        reference_sdpa(ref.data(), q.data(), k.data(), v.data(), mask.data(),
++                       B, H, L, S, D, DV, 0.0625f);
++        std::vector<float> got = run_fused_sdpa(q.data(), k.data(), v.data(),
++                       mask.data(), B, H, L, S, D, DV, 0.0625f, 1, true);
++        const double err = nmse(ref.data(), got.data(), ref.size());
++        const bool ok = err < 1e-4;
++        printf("  SDPA B=%lld H=%lld L=%lld S=%lld D=%lld DV=%lld mask=f16 NMSE=%.3e %s\n",
++               (long long)B, (long long)H, (long long)L, (long long)S,
++               (long long)D, (long long)DV, err, RESULT_STR[!ok]);
++        failures += !ok;
++    }
++    // Large S (KV does not fit L3): exercises the taskloop path
++    {
++        const int64_t B = 1, H = 1, L = 64, S = 131072, D = 64, DV = 64;
++        std::vector<float> q(B*H*L*D), k(B*H*S*D), v(B*H*S*DV);
++        fill_float(q.data(), q.size(), -1, 1, 111);
++        fill_float(k.data(), k.size(), -1, 1, 222);
++        fill_float(v.data(), v.size(), -1, 1, 333);
++        std::vector<float> ref(B*H*L*DV);
++        reference_sdpa(ref.data(), q.data(), k.data(), v.data(), nullptr,
++                       B, H, L, S, D, DV, 0.125f);
++        std::vector<float> got = run_fused_sdpa(q.data(), k.data(), v.data(),
++                       nullptr, B, H, L, S, D, DV, 0.125f, 1);
++        const double err = nmse(ref.data(), got.data(), ref.size());
++        const bool ok = err < 1e-4;
++        printf("  SDPA B=%lld H=%lld L=%lld S=%lld D=%lld DV=%lld taskloop NMSE=%.3e %s\n",
++               (long long)B, (long long)H, (long long)L, (long long)S,
++               (long long)D, (long long)DV, err, RESULT_STR[!ok]);
++        failures += !ok;
++    }
 +
 +    printf("\n=== GEMM (ggml_mul_mat, mock) ===\n");
 +    // Real model GEMM shapes (M = output, K = input, N = seq).
@@ -361,6 +408,11 @@ index 00000000..7167f8b3
 +    GEMM_CASE(GGML_TYPE_Q8_0, 4096,  8, 1024);   // bge-m3 ffn_up
 +    GEMM_CASE(GGML_TYPE_F16, 1024,   8, 4096);   // bge-m3 ffn_down
 +    GEMM_CASE(GGML_TYPE_Q8_0, 1024,  8, 4096);   // bge-m3 ffn_down
++    // coverage: f16 4x4 leftovers (M/N not multiple of 16x8), N=1 decode path, f32 vec_dot leftovers, q8 padded/4x4 tail
++    GEMM_CASE(GGML_TYPE_F16,  10,   6,  512);
++    GEMM_CASE(GGML_TYPE_F16,  16,   1,  512);
++    GEMM_CASE(GGML_TYPE_F32,   5,   3,  256);
++    GEMM_CASE(GGML_TYPE_Q8_0, 32,   6,  512);
 +
 +    printf("\n=== %d cases failed ===\n", failures);
 +    return failures == 0 ? 0 : 1;

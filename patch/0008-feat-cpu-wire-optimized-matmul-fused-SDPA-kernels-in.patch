@@ -1,4 +1,4 @@
-From 7a3aa6e193195da91fe60869d04c89747a52b166 Mon Sep 17 00:00:00 2001
+From 5c4d246e37f2b53b1ebe157bf829a13dbd8d9468 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:20:13 +0800
 Subject: [PATCH 08/11] feat(cpu): wire optimized matmul & fused SDPA kernels
