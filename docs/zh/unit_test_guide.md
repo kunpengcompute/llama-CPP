@@ -96,8 +96,6 @@ cmake --build build-delivery --target test-sdpa-f16q80-opt -j
 cmake --build build-delivery -j
 ```
 
-> **说明**：在已有构建目录中新增测试后，需重新执行`cmake .`使其纳入构建系统。
-
 ## 5. 启动测试
 
 ```bash
