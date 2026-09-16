@@ -1,15 +1,15 @@
 # 快速入门
 
-本文介绍如何基于官方llama.cpp（commit `3ac67535c86`）checkout代码、合入优化补丁并完成编译，使用户快速体验llama-CPP在鲲鹏950处理器/鲲鹏920新型号处理器上提供的CPU算子优化能力。优化补丁聚焦FP16/FP32/Q8_0矩阵乘法与fused SDPA注意力算子，可提升llama.cpp在CPU小模型推理场景下的性能。
+本文档介绍如何基于官方llama.cpp（commit `3ac67535c86`）checkout代码、合入优化补丁并完成编译，使用户快速体验llama-CPP在鲲鹏950处理器/鲲鹏920新型号处理器上提供的CPU算子优化能力。优化补丁聚焦FP16/FP32/Q8_0矩阵乘法与fused SDPA注意力算子，可提升llama.cpp在CPU小模型推理场景下的性能。
 
 ## 环境要求
 
-- 硬件平台：鲲鹏950处理器/鲲鹏920新型号处理器（NEON / SVE-256 / i8mm）
-- 操作系统：openEuler 22.03 LTS SP3及以上版本
-- 编译器：GCC/G++ 12.3.1或更新版本（需支持`armv8.6-a+dotprod+i8mm+sve`）
-- 构建依赖：cmake >= 3.20、ninja（推荐）、git
+- 硬件平台：鲲鹏950处理器/鲲鹏920新型号处理器（NEON / SVE-256 / i8mm）。
+- 操作系统：openEuler 22.03 LTS SP3及以上版本。
+- 编译器：GCC/G++ 12.3.1或更新版本（需支持`armv8.6-a+dotprod+i8mm+sve`）。
+- 构建依赖：cmake >= 3.20、ninja（推荐）、git。
 
-## 1. 获取代码并checkout到对应commit
+## 获取代码并checkout到对应commit
 
 优化补丁基于官方llama.cpp（commit `3ac67535c86`），请先将源码切换并固定到该commit。
 
@@ -26,7 +26,7 @@
    git checkout 3ac67535c86
    ```
 
-## 2. 合入优化补丁
+## 合入优化补丁
 
 llama-CPP优化补丁位于仓库`patch/`目录下的`0001`至`0011`补丁文件（`00*.patch`），在llama.cpp源码目录中合并即可。
 
@@ -43,7 +43,7 @@ llama-CPP优化补丁位于仓库`patch/`目录下的`0001`至`0011`补丁文件
    git am /path/to/llama-CPP/patch/00*.patch
    ```
 
-## 3. 编译
+## 编译
 
 使用`compile.sh`一键编译。
 
@@ -51,18 +51,18 @@ llama-CPP优化补丁位于仓库`patch/`目录下的`0001`至`0011`补丁文件
 ./compile.sh build-delivery
 ```
 
->**说明：**
+>![表示说明的图片](./public_sys-resources/icon-note.gif)**说明：**
 >默认编译（-O3 RelWithDebInfo）会构建ggml-cpu、llama-embedding、llama-bench和llama-server，编译结果位于`build-delivery/bin/`。
 
-## 4. 验证与进一步阅读
+## 验证
 
 编译完成后，可运行单元测试验证优化算子正确性。
 
 ```bash
-build-delivery/bin/test-sdpa-f16q80-opt
+./build-delivery/bin/test-sdpa-f16q80-opt
 ```
 
-更多内容请参见：
+## 学习文档
 
 - 《[用户指南](./user_guide.md)》：bge-m3等Embedding模型的部署与调优。
 - 《[特性介绍](./feature_introduction.md)》：优化算子的特性与原理。
