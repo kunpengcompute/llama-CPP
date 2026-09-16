@@ -1,25 +1,27 @@
-# User Guide for BGE Model Performance Optimization Based on llama.cpp
+# llama.cpp-based BGE Model Tuning User Guide
 
-This document provides tuning guidance for applying the optimization patches, building, deploying, and running Embedding models such as bge-m3 on Kunpeng processors (using the Kunpeng 920B as an example) with the community llama.cpp (commit `3ac67535c86`).
+## Tuning Overview
+
+This document provides tuning guidance based on Kunpeng 950 processors/new Kunpeng 920 processor models. It describes how to apply optimization patches and compile and deploy the code based on the official llama.cpp repository (commit `3ac67535c86`), as well as how to run embedding models such as bge-m3.
 
 ## Environment Requirements
 
-- Hardware platform: Kunpeng processor (e.g., Kunpeng 920B; NEON / SVE-256 / i8mm)
-- Operating system: openEuler 22.03 LTS SP3
-- Compiler: GCC/G++ 15.2.0 or later (must support `armv8.6-a+dotprod+i8mm+sve`)
-- Build dependencies: cmake >= 3.20, ninja (recommended), git
-- Model selection: Embedding models such as bge-m3 and bge-small-zh-v1.5 (FP16 / Q8_0 GGUF format)
+- Hardware platform: Kunpeng 950 processor/New Kunpeng 920 processor (NEON/SVE-256/i8mm).
+- OS: openEuler 22.03 LTS SP3 or later.
+- Compiler: GCC/G++ 12.3.1 or later (compatibility with `armv8.6-a+dotprod+i8mm+sve` required).
+- Build dependencies: cmake >= 3.20, ninja (recommended), and git.
+- Model selection: embedding models such as bge-m3 and bge-small-zh-v1.5 (FP16/Q8_0 GGUF format).
 
 ## Optimization Patches
 
-The patches are based on the official llama.cpp commit `3ac67535c86`, matching the commit version in the image `swr.cn-north-4.myhuaweicloud.com/kunpeng-ai/llama.cpp:920B-kunpeng`.
+The optimization patches are based on the official llama.cpp repository (commit `3ac67535c86`).
 
 1. Pull the code. The following uses `/home/code` as an example.
 
    ```bash
    mkdir -p /home/code
    cd /home/code
-   git clone <llama-CPP repository URL> && cd llama-CPP
+   git clone <llama-CPP_repository_address> && cd llama-CPP
    ```
 
 2. Apply the optimization patches.
@@ -28,18 +30,20 @@ The patches are based on the official llama.cpp commit `3ac67535c86`, matching t
    git am /home/code/llama-CPP/patch/00*.patch
    ```
 
-## Build
+## Optimization Patch Compilation
 
-Use `compile.sh` for one-click building (`compile.sh` is introduced together with patches `0009` and `0010`).
+Use `compile.sh` for one-click compilation (`compile.sh` is introduced together with patches `0009` and `0010`).
 
 ```bash
-# Default build (-O3 RelWithDebInfo; builds ggml-cpu / llama-embedding / llama-bench / llama-server)
 ./compile.sh build-delivery
 ```
 
-Build outputs are located in `build-delivery/bin/`.
+> ![icon-note](./public_sys-resources/icon-note.gif)**NOTE:**
+>By default, the compilation (`-O3 RelWithDebInfo`) builds ggml-cpu/llama-embedding/llama-bench/llama-server.
 
-## Start the Service
+The compilation results are located in `build-delivery/bin/`.
+
+## Service Launching
 
 ```bash
 taskset -c $(seq -s, 128 2 158) env \
@@ -51,17 +55,17 @@ taskset -c $(seq -s, 128 2 158) env \
     --ctx-size 8192 --threads 16 --pooling cls
 ```
 
-The `GGML_FUSED_CPP_SDPA` environment variable controls the fused SDPA path. It is enabled by default and recommended for better performance:
+The `GGML_FUSED_CPP_SDPA` environment variable controls whether to enable the fused SDPA path. It is enabled by default. Enabling it delivers better performance and is recommended.
 
 | Environment Variable Value | Effect |
-| -------------------------- | ------ |
-| `0` / `off` / `false` / `no` | Disable fused SDPA and fall back to native flash_attn |
-| `debug` / `trace` | Enable fused SDPA debug logs |
-| Empty / other | Enabled by default |
+| ---------- | ---- |
+| <code>0</code>/<code>off</code>/<code>false</code>/<code>no</code> | Disables fused SDPA and falls back to the official flash_attn. |
+| <code>debug</code>/<code>trace</code> | Enables fused SDPA debug logging. |
+| Empty/Other | Enabled by default. |
 
 ## Performance Verification
 
-### Single Core
+### Single-Core Performance
 
 ```bash
 taskset -c 128 env \
@@ -69,20 +73,20 @@ taskset -c 128 env \
     ./build-delivery/bin/llama-bench -m /path/to/bge-m3-FP16.gguf -p 512 -b 512 -n 0 -t 1 -r 1
 ```
 
-### Whole Machine
+### Full-System Performance
 
-Modify the file paths at the top of `bench_bgem3_full.py` and run it. The highest TPS is the optimal whole-machine performance.
+After modifying the file path at the top of `bench_bgem3_full.py`, run it. The highest TPS is the optimal full-system performance.
 
 ```bash
-vim bench_bgem3_full.py   # modify the file paths at the top
+vim bench_bgem3_full.py
 python bench_bgem3_full.py
 ```
 
 ## Accuracy Verification
 
-Before accuracy verification, prepare the official baseline source and fix the baseline using `patch/baseline-bug-fixed.patch`.
+Before accuracy verification, prepare the official llama.cpp source code (commit `3ac67535c86`) and use `patch/baseline-bug-fixed.patch` to fix the baseline issues in it.
 
-1. Get the official llama.cpp source and check out the matching commit:
+1. Obtain the official llama.cpp source code and check out the corresponding commit.
 
    ```bash
    git clone https://github.com/ggml-org/llama.cpp.git /home/code/llama.cpp-baseline
@@ -90,7 +94,7 @@ Before accuracy verification, prepare the official baseline source and fix the b
    git checkout 3ac67535c86
    ```
 
-2. Apply the baseline fix patch and build:
+2. Apply the baseline fix patch and compile the code.
 
    ```bash
    git apply /home/code/llama-CPP/patch/baseline-bug-fixed.patch
@@ -102,19 +106,14 @@ Before accuracy verification, prepare the official baseline source and fix the b
    cmake --build build-baseline-fixed --config release --target ggml-cpu llama-embedding llama-bench llama-server -j 20
    ```
 
-3. Start the server with this version, then verify accuracy using the commands below.
+3. After starting the server with this version, verify accuracy using the following commands.
 
 ```bash
-# --servers is followed by <server_name>=<server url>, separated by spaces
-# --server-workers equals the number of servers above (one worker per server)
-# --cmteb-root is your C-MTEB dataset path
-# If a task score is NaN, run that task separately
-
 python eval_llamacpp_cmteb.py \
---servers baseline=http://141.61.21.62:8080 opt=http://141.61.21.62:7080 \
+--servers baseline=http://<ip>:<port> opt=<ip>:<port> \
 --server-workers 2 \
 --task-names   TNews IFlyTek MultilingualSentiment JDReview OnlineShopping Waimai     CLSClusteringS2S.v2 CLSClusteringP2P.v2 ThuNewsClusteringS2S.v2 ThuNewsClusteringP2P.v2     Ocnli Cmnli     T2Reranking MMarcoReranking CMedQAv1-reranking CMedQAv2-reranking     ATEC BQ LCQMC PAWSX STSB AFQMC QBQTC   \
---cmteb-root /home/l30061571/models/datasets/C-MTEB \
+--cmteb-root /path/to/C-MTEB \
 --batch-size 1 \
 --max-chars 500 \
 --skip-bad-embedding \
@@ -122,4 +121,17 @@ python eval_llamacpp_cmteb.py \
 --continue-on-error
 ```
 
-For detailed kernel interfaces, algorithms, and test criteria, see the technical report (`technical_report.md`) and feature introduction (`feature_introduction.md`) under `docs/zh/`.
+> ![icon-note](./public_sys-resources/icon-note.gif)**NOTE:**
+>
+>- Set the llama servers following `servers` in the format of `<server_name>=<server url>`. Multiple servers are separated by spaces.
+>- The number of server-workers equals the number of servers above; use one worker for each server being tested.
+>- Change the path following `cmteb-root` to your own C-MTEB dataset path.
+>- If a task's score is `NaN`, you can run that task again.
+
+For detailed kernel interfaces, algorithms, and test standards, see [Technical Report](./technical_report.md) and [Feature Introduction](./feature_introduction.md).
+
+## Change History
+
+| Version | Date | Description |
+| :--- | :--- | :--- |
+| 01 | 2026-09-30 | This is the first official release. |
