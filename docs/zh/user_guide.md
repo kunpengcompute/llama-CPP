@@ -6,11 +6,11 @@
 
 ## 环境要求
 
-- 硬件平台：鲲鹏950处理器/鲲鹏920新型号处理器（NEON / SVE-256 / i8mm）
-- 操作系统：openEuler 22.03 LTS SP3及以上版本
-- 编译器：GCC/G++ 12.3.1或更新版本（需支持`armv8.6-a+dotprod+i8mm+sve`）
-- 构建依赖：cmake >= 3.20、ninja（推荐）、git
-- 模型选择：bge-m3、bge-small-zh-v1.5等Embedding模型（FP16/Q8_0 GGUF格式）
+- 硬件平台：鲲鹏950处理器/鲲鹏920新型号处理器（NEON / SVE-256 / i8mm）。
+- 操作系统：openEuler 22.03 LTS SP3及以上版本。
+- 编译器：GCC/G++ 12.3.1或更新版本（需支持`armv8.6-a+dotprod+i8mm+sve`）。
+- 构建依赖：cmake >= 3.20、ninja（推荐）、git。
+- 模型选择：bge-m3、bge-small-zh-v1.5等Embedding模型（FP16/Q8_0 GGUF格式）。
 
 ## 适配优化补丁
 
@@ -38,7 +38,7 @@
 ./compile.sh build-delivery
 ```
 
->**说明：**
+> ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明：**
 >默认编译（-O3 RelWithDebInfo，构建ggml-cpu/llama-embedding/llama-bench/ llama-server）
 
 编译结果位于`build-delivery/bin/`。
@@ -59,8 +59,8 @@ taskset -c $(seq -s, 128 2 158) env \
 
 | 环境变量值 | 效果 |
 | ---------- | ---- |
-| `0` / `off` / `false` / `no` | 关闭fused SDPA，回退到官方flash_attn |
-| `debug` / `trace` | 启用fused SDPA调试日志 |
+| 0/off/false/no | 关闭fused SDPA，回退到官方flash_attn |
+| debug/trace | 启用fused SDPA调试日志 |
 | 空 /其他 | 默认启用 |
 
 ## 性能验证
@@ -78,7 +78,7 @@ taskset -c 128 env \
 修改`bench_bgem3_full.py`顶部的文件路径后运行，最高TPS即为整机最优性能。
 
 ```bash
-vim bench_bgem3_full.py   
+vim bench_bgem3_full.py
 python bench_bgem3_full.py
 ```
 
@@ -103,7 +103,7 @@ python bench_bgem3_full.py
    cmake -DCMAKE_BUILD_TYPE=Release \
                -B build-baseline-fixed -GNinja \
                -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF
-   cmake --build build-baseline-fixed --config release --target ggml-cpu llama-embedding llama-bench llama-server -j 20 
+   cmake --build build-baseline-fixed --config release --target ggml-cpu llama-embedding llama-bench llama-server -j 20
    ```
 
 3. 用该版本启动server后，按下面的命令验证精度。
@@ -121,7 +121,7 @@ python eval_llamacpp_cmteb.py \
 --continue-on-error
 ```
 
->**说明：**
+> ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明：**
 >
 >- servers后面以`<server_name>=<server url>`设置llama server，使用空格分离多个server。
 >- server-workers数量等于上面的server数量，测试几个server就用几个worker。
@@ -132,6 +132,6 @@ python eval_llamacpp_cmteb.py \
 
 ## 修订记录
 
-| 发布日期 | 修订记录 |
-| :--- | :--- |
-| 2026-08-24 | 第一次正式发布。 |
+| 文档版本 | 发布日期 | 修改说明 |
+| :--- | :--- | :--- |
+| 01 | 2026-09-30 | 第一次正式发布。 |
