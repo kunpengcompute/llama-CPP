@@ -1,21 +1,21 @@
 # 算子优化单元测试指南
 
-## 1.测试介绍
+## 测试介绍
 
 `tests/test-sdpa-f16q80-opt`是基于合成（mock）数据的正确性单元测试，用于验证两条推理路径。
 
-| 路径 | ggml 算子 |
+| 路径 | ggml算子 |
 | ------ | ----------- |
 | 融合注意力（SDPA） | `GGML_OP_FUSED_CPP_SDPA_EXT`（`ggml_fused_cpp_sdpa_ext`） |
 | 矩阵乘（GEMM） | `ggml_mul_mat`（F32/F16/Q8_0权重） |
 
 测试不依赖模型文件或任何外部输入：进程内生成合成张量，经真实ggml CPU计算图执行端到端推理，并与C++数学参考实现比对。
 
-## 2. 测试覆盖范围
+## 测试覆盖范围
 
-### 2.1 fused SDPA（6例）
+### fused SDPA（6例）
 
-参数`(B, H, L, S, D, DV, scale, mask)`。覆盖多batch、多头、带/不带mask；`DV` 均为8的倍数（算子约束）。
+参数`(B, H, L, S, D, DV, scale, mask)`。覆盖多batch、多头、带/不带mask；`DV`均为8的倍数（算子约束）。
 
 ```text
 B=1 H=2 L=8  S=8  D=32  DV=32  scale=0.125  mask=0
@@ -26,12 +26,12 @@ B=1 H=1 L=16 S=16 D=32  DV=32  scale=0.125  mask=0
 B=1 H=1 L=16 S=16 D=32  DV=32  scale=0.125  mask=1
 ```
 
-### 2.2 GEMM（14例）
+### GEMM（14例）
 
 **GEMM shape取自真实embedding模型的线性层。**
 
-- **bge-small-zh-v1.5**：`hidden=512, intermediate=2048` -&gt; attn Q/K/V/O `M=512,K=512`，ffn_up `M=2048,K=512`，ffn_down `M=512,K=2048`
-- **bge-m3**：`hidden=1024, intermediate=4096` -&gt; attn `M=1024,K=1024`，ffn_up `M=4096,K=1024`，ffn_down `M=1024,K=4096`
+- **bge-small-zh-v1.5**：`hidden=512, intermediate=2048`; attn Q/K/V/O `M=512,K=512`，ffn_up `M=2048,K=512`，ffn_down `M=512,K=2048`
+- **bge-m3**：`hidden=1024, intermediate=4096`; attn `M=1024,K=1024`，ffn_up `M=4096,K=1024`，ffn_down `M=1024,K=4096`
 
 ```text
 权重类型  M    N    K    对应层（模型）
@@ -51,7 +51,7 @@ f16    1024    8 4096  ffn_down（bge-m3）-> FP16 NEON GEMM
 q8_0   1024    8 4096  ffn_down（bge-m3）-> Q8_0 NEON GEMM
 ```
 
-### 2.3 测试涉及的关键路径函数
+### 测试涉及的关键路径函数
 
 测试通过真实ggml`mul_mat`/融合SDPA dispatch触发以下优化内核（ARM/NEON），确保**FP16 GEMM NEON 算子**与 **Q8_0 GEMM NEON 算子**被实际执行并验证。
 
@@ -62,19 +62,19 @@ q8_0   1024    8 4096  ffn_down（bge-m3）-> Q8_0 NEON GEMM
 | F32 GEMM | `ggml_matmul_f32_4x4_kernel` |
 | 融合 SDPA | `ggml_compute_forward_fused_cpp_sdpa_ext` -&gt; `fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp` / `..._mask_f16` / `..._mask_f32` |
 
-> **说明**：`f16`与`q8_0`会命中上述NEON GEMM加速内核；`f32`作为参考基线对照。
+> ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明**：`f16`与`q8_0`会命中上述NEON GEMM加速内核；`f32`作为参考基线对照。
 
-## 3. 测试原理
+## 测试原理
 
 测试用带种子的伪随机函数生成可复现的合成数据，将数据写入ggml张量，构建计算图并在CPU后端执行。再由C++参考实现计算期望结果，最后以归一化均方误差（NMSE，`nmse(a, b) = Σ(a - b)² / Σa²`）判定结果是否正确。判定阈值如下：fused SDPA `NMSE < 1e-4`；GEMM按权重类型区分，F32/Q8_0 `NMSE < 1e-4`，F16 `NMSE < 5e-3`（FP16累加精度随K增大而降低，故F16阈值放宽）。
 
-### 3.1 SDPA参考
+### SDPA参考
 
 1. `reference_sdpa()`复现`out = softmax(scale · Q·Kᵀ + mask) · V`。
 2. q/k/v/out按ggml张量`ne`的连续内存索引访问（innermost=`ne[0]`）。
 3. mask按`[L, S]`布局（`mask[l*S + s]`）叠加。
 
-### 3.2 GEMM参考
+### GEMM参考
 
 1. `reference_matmul()`复现`ggml_mul_mat`约定。
 
@@ -84,7 +84,7 @@ q8_0   1024    8 4096  ffn_down（bge-m3）-> Q8_0 NEON GEMM
 
 2. 激活按N×K读取（右侧操作数按转置处理）；输出采用`ne=[M, N]`的raw布局`i + j·M`。
 
-## 4. 编译
+## 编译
 
 fused SDPA算子仅在ARM构建（`GGML_USE_FUSED_CPP_SDPA`）编译进ggml-cpu，测试因此在 `tests/CMakeLists.txt`中以架构门控（`aarch64|arm`）参与构建，随tests一起编译。无需额外CMake变量或模型路径。
 
@@ -96,9 +96,9 @@ cmake --build build-delivery --target test-sdpa-f16q80-opt -j
 cmake --build build-delivery -j
 ```
 
-> **说明**：在已有构建目录中新增测试后，需重新执行`cmake .`使其纳入构建系统。
+> ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明**：在已有构建目录中新增测试后，需重新执行`cmake .`使其纳入构建系统。
 
-## 5. 启动测试
+## 启动测试
 
 ```bash
 build-delivery/bin/test-sdpa-f16q80-opt
@@ -107,11 +107,11 @@ ctest --test-dir build-delivery -L fused-sdpa
 ctest --test-dir build-delivery -R test-sdpa-f16q80-opt
 ```
 
-> **说明**：全部用例通过返回0，任一失败返回1。
+> ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明**：全部用例通过返回0，任一失败返回1。
 
-## 6. 测试预期输出
+## 测试预期输出
 
-- build-delivery/bin/test-sdpa-f16q80-opt
+- build-delivery/bin/test-sdpa-f16q80-opt。
 
 ``` text
 === fused SDPA (GGML_OP_FUSED_CPP_SDPA_EXT) ===
@@ -141,7 +141,7 @@ ctest --test-dir build-delivery -R test-sdpa-f16q80-opt
 === 0 cases failed ===
 ```
 
-- ctest --test-dir build-delivery -L fused-sdpa
+- ctest --test-dir build-delivery -L fused-sdpa。
 
 ```text
     Start 29: test-sdpa-f16q80-opt
@@ -155,7 +155,7 @@ fused-sdpa    =   0.59 sec*proc (1 test)
 Total Test time (real) =   0.60 sec
 ```
 
-- ctest --test-dir build-delivery -R test-sdpa-f16q80-opt
+- ctest --test-dir build-delivery -R test-sdpa-f16q80-opt。
 
 ```text
     Start 29: test-sdpa-f16q80-opt
