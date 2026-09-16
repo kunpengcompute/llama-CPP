@@ -96,8 +96,6 @@ cmake --build build-delivery --target test-sdpa-f16q80-opt -j
 cmake --build build-delivery -j
 ```
 
-> ![icon-note](./public_sys-resources/icon-note.gif)**NOTE:** After adding a new test to an existing build directory, re-run `cmake .` to include it in the build system.
-
 ## Testing
 
 ```bash

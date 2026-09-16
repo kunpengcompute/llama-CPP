@@ -28,7 +28,7 @@ llama-CPP是针对鲲鹏950处理器/鲲鹏920新型号处理器进行的CPU算�
 - FP16矩阵乘法优化：NEON软件流水线点积、4×4外积tile、outer-packA 8×16手写外积kernel。
 - FP32矩阵乘法优化：SVE 4×4 tile kernel。
 - Q8_0量化矩阵乘法优化：MMLA（i8mm+Spack数据打包）。
-- Fused SDPA（FlashAttention v2 NEON融合算子）与对角分块优化。
+- Fused SDPA（FlashAttention v2 NEON融合算子）。
 - 官方llama.cpp的embedding normalize/similarity双精度修复及server输出路径相关修复。
 
 ### 已解决的问题

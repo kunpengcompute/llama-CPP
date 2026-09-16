@@ -103,7 +103,7 @@ Before accuracy verification, prepare the official llama.cpp source code (commit
    cmake -DCMAKE_BUILD_TYPE=Release \
                -B build-baseline-fixed -GNinja \
                -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF
-   cmake --build build-baseline-fixed --config release --target ggml-cpu llama-embedding llama-bench llama-server -j 20
+   cmake --build build-baseline-fixed --target ggml-cpu llama-embedding llama-bench llama-server -j 20
    ```
 
 3. After starting the server with this version, verify accuracy using the following commands.
