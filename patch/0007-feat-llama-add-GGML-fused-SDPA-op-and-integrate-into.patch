@@ -18,9 +18,9 @@ Subject: [PATCH 07/11] feat(llama): add GGML fused SDPA op and integrate into
  ggml/src/ggml-cpu/ops.cpp        | 176 ++++++++++++++++++++++++++++++-
  ggml/src/ggml-cpu/ops.h          |   1 +
  ggml/src/ggml.c                  |  45 +++++++-
- src/llama-graph.cpp              |  88 +++++++++++++++-
+ src/llama-graph.cpp              |  91 ++++++++++++++++-
  src/llama-graph.h                |   4 +
- 7 files changed, 335 insertions(+), 4 deletions(-)
+ 7 files changed, 338 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 1a57f1cd..02bf7fc9 100644
@@ -425,7 +425,7 @@ index c4bdd660..68b714a4 100644
  ggml_tensor * llm_graph_context::build_attn_mha(
           ggml_cgraph * gf,
           ggml_tensor * q,
-@@ -1077,10 +1107,66 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -1077,10 +1107,69 @@ ggml_tensor * llm_graph_context::build_attn_mha(
      const auto n_head   = q->ne[2];
      const auto n_kv     = k->ne[1];
  
@@ -447,6 +447,9 @@ index c4bdd660..68b714a4 100644
 +    // the fused path enabled for all lengths instead.
 +    const bool use_fused_cpp_attn =
 +        build_attn_mha_use_fused_sdpa() &&
++        // the fused SDPA op does not accept a KQ bias; fall back to the
++        // matmul path (which applies kq_b via ggml_add) when one is present
++        kq_b == nullptr &&
 +        backend_cpu != nullptr &&
 +        v_mla == nullptr &&
 +        hparams.f_max_alibi_bias == 0.0f &&
