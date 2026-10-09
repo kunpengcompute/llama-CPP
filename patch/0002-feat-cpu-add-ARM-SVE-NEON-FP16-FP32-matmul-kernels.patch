@@ -1,4 +1,4 @@
-From 4e02a0da109cbc96641695829f328579116a4d36 Mon Sep 17 00:00:00 2001
+From 565450c7ba4eba1ce49d50abd6910d9d1e4bedf7 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:18:57 +0800
 Subject: [PATCH 02/11] feat(cpu): add ARM SVE/NEON FP16 & FP32 matmul kernels
@@ -13,9 +13,9 @@ Subject: [PATCH 02/11] feat(cpu): add ARM SVE/NEON FP16 & FP32 matmul kernels
     so leftover elements past the first vector are always covered
 ---
  ggml/include/ggml-cpu.h   |   16 +
- ggml/src/ggml-cpu/vec.cpp | 1430 ++++++++++++++++++++++++++++++++-
- ggml/src/ggml-cpu/vec.h   |  116 ++-
- 3 files changed, 1556 insertions(+), 6 deletions(-)
+ ggml/src/ggml-cpu/vec.cpp | 1434 ++++++++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cpu/vec.h   |  120 +++-
+ 3 files changed, 1564 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
 index de77a875..562adfac 100644
@@ -52,7 +52,7 @@ index de77a875..562adfac 100644
  
      GGML_BACKEND_API void ggml_cpu_init(void);
 diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
-index f7614568..555203ab 100644
+index f7614568..62857cda 100644
 --- a/ggml/src/ggml-cpu/vec.cpp
 +++ b/ggml/src/ggml-cpu/vec.cpp
 @@ -2,6 +2,12 @@
@@ -85,10 +85,12 @@ index f7614568..555203ab 100644
          }
          // reduce sum1,sum2 to sum1
          GGML_F32_VEC_REDUCE(sumf, sum1, sum2, sum3, sum4, sum5, sum6, sum7, sum8);
-@@ -230,6 +238,1424 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
+@@ -230,6 +238,1428 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
      *s = sumf;
  }
  
++#if defined(__ARM_FEATURE_SVE)
++
 +float16x8_t svget_neonq_f16(svfloat16_t sve_vec) {
 +    // return svget_neonq(sve_vec);
 +    float16_t v[svcnth()];
@@ -1507,18 +1509,23 @@ index f7614568..555203ab 100644
 +    matmul_outer_packA_destroy(pack_a);
 +}
 +
++#endif // defined(__ARM_FEATURE_SVE)
++
  void ggml_vec_silu_f32(const int n, float * y, const float * x) {
      int i = 0;
  #if defined(__AVX512F__) && defined(__AVX512DQ__)
-
 diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
-index 09dbade2..c4bb0f23 100644
+index 09dbade2..87117c77 100644
 --- a/ggml/src/ggml-cpu/vec.h
 +++ b/ggml/src/ggml-cpu/vec.h
-@@ -43,6 +43,107 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
+@@ -43,6 +43,111 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
  void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc);
  void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
  
++static size_t g_chunk_size_outer_packA = 128;
++
++#if defined(__ARM_FEATURE_SVE)
++
 +void ggml_matmul_f32_4x4_kernel(size_t na, size_t nb, int dim, const void* GGML_RESTRICT a, const void* GGML_RESTRICT b, void* GGML_RESTRICT c, size_t c_column_bytes);
 +void ggml_matmul_f16_4x4_kernel(size_t na, size_t nb, int dim, const void* GGML_RESTRICT a, const void* GGML_RESTRICT b, void* GGML_RESTRICT c, size_t c_column_bytes);
 +
@@ -1529,8 +1536,6 @@ index 09dbade2..c4bb0f23 100644
 +                                       const matmul_outer_pack_t* pack_b,
 +                                       void* GGML_RESTRICT c,
 +                                       size_t c_column_bytes);
-+
-+static size_t g_chunk_size_outer_packA = 128;
 +
 +typedef void (*matmul_outer_packA_func)(size_t M,
 +                                        size_t N,
@@ -1620,10 +1625,12 @@ index 09dbade2..c4bb0f23 100644
 +    matmul_outer_packA_b(na, nb, dim, 16, a, b, c, c_column_bytes, matmul_outer_8x16_b_micro_packA_f16);
 +}
 +
++#endif // defined(__ARM_FEATURE_SVE)
++
  void ggml_vec_silu_f32(const int n, float * y, const float * x);
  ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max);
  ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, float max);
-@@ -376,11 +477,18 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
+@@ -376,11 +481,18 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
          }
          // leftovers
          // maximum number of leftover elements will be less that ggml_f32_epr. Apply predicated svmad on available elements only
@@ -1646,3 +1653,6 @@ index 09dbade2..c4bb0f23 100644
          }
      #else
          const int np = (n & ~(GGML_F32_STEP - 1));
+-- 
+2.43.0
+

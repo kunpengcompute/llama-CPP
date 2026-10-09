@@ -1,4 +1,4 @@
-From a13dbb7bae7cde4363d9324721d3459c4cd5274b Mon Sep 17 00:00:00 2001
+From e660e732c528ead5ac239d05b0aba6eea254d5bb Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:19:52 +0800
 Subject: [PATCH 06/11] feat(cpu): add fused SDPA fp32 packqkv front-end
@@ -2755,3 +2755,6 @@ index 00000000..5a798998
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+-- 
+2.43.0
+

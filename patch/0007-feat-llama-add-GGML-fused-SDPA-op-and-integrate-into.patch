@@ -1,4 +1,4 @@
-From 1f71fc565c5576ca03e4a03c6a2470e33e5b6359 Mon Sep 17 00:00:00 2001
+From f9257339c9cfd7fbb3d0d087415b13400f52d636 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:20:06 +0800
 Subject: [PATCH 07/11] feat(llama): add GGML fused SDPA op and integrate into
@@ -14,13 +14,13 @@ Subject: [PATCH 07/11] feat(llama): add GGML fused SDPA op and integrate into
   (env GGML_FUSED_CPP_SDPA can disable/debug)
 ---
  ggml/include/ggml.h              |  11 ++
- ggml/src/ggml-cpu/CMakeLists.txt |  14 +++
+ ggml/src/ggml-cpu/CMakeLists.txt |  12 +++
  ggml/src/ggml-cpu/ops.cpp        | 176 ++++++++++++++++++++++++++++++-
  ggml/src/ggml-cpu/ops.h          |   1 +
  ggml/src/ggml.c                  |  45 +++++++-
- src/llama-graph.cpp              |  91 ++++++++++++++++-
+ src/llama-graph.cpp              |  91 +++++++++++++++-
  src/llama-graph.h                |   4 +
- 7 files changed, 338 insertions(+), 4 deletions(-)
+ 7 files changed, 336 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 1a57f1cd..02bf7fc9 100644
@@ -52,7 +52,7 @@ index 1a57f1cd..02bf7fc9 100644
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
 diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
-index 33f66af8..19e4f27a 100644
+index 33f66af8..792517af 100644
 --- a/ggml/src/ggml-cpu/CMakeLists.txt
 +++ b/ggml/src/ggml-cpu/CMakeLists.txt
 @@ -84,6 +84,18 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
@@ -74,12 +74,6 @@ index 33f66af8..19e4f27a 100644
          if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
              message(FATAL_ERROR "MSVC is not supported for ARM, use clang")
          else()
-@@ -493,3 +505,5 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
-         set_target_properties(${GGML_CPU_NAME} PROPERTIES COMPILE_FLAGS "-msimd128")
-     endif()
- endfunction()
-+
-+set(ARCH_FLAGS "-mcpu=hip09+crypto+fp16+rcpc+sha3+sm4+bf16+nodotprod+noprofile+nopredres+nof32mm+nof64mm+dotprod+noi8mm+sve")
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 index d8de7531..ab700776 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
@@ -378,7 +372,7 @@ index 196b7b8f..acda47bb 100644
          struct ggml_tensor * a,
          enum ggml_prec       prec) {
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index c4bdd660..68b714a4 100644
+index c4bdd660..6f13c9d2 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -10,6 +10,7 @@
@@ -511,3 +505,6 @@ index d1c5dd1b..83c5344f 100644
      ggml_tensor * build_attn_mha(
               ggml_cgraph * gf,
               ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+-- 
+2.43.0
+
