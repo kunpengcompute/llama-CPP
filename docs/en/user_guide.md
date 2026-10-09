@@ -128,7 +128,6 @@ python eval_llamacpp_cmteb.py \
 >- Change the path following `cmteb-root` to your own C-MTEB dataset path.
 >- If a task's score is `NaN`, you can run that task again.
 
-
 ## Change History
 
 | Version | Date | Description |

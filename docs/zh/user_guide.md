@@ -128,7 +128,6 @@ python eval_llamacpp_cmteb.py \
 >- cmteb-root改成自己的C-MTEB数据集路径。
 >- 如果Task的分数是NaN，可以再重新运行该Task。
 
-
 ## 修订记录
 
 | 文档版本 | 发布日期 | 修改说明 |
