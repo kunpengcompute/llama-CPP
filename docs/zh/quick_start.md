@@ -67,7 +67,6 @@ llama-CPP优化补丁位于仓库`patch/`目录下的`0001`至`0011`补丁文件
 - 《[用户指南](./user_guide.md)》：bge-m3等Embedding模型的部署与调优。
 - 《[特性介绍](./feature_introduction.md)》：优化算子的特性与原理。
 - 《[单元测试指南](./unit_test_guide.md)》：单元测试的编译、执行与预期输出。
-- 《[技术报告](./technical_report.md)》：精度与性能验证数据。
 - 《[版本说明书](./release_notes.md)》：发布版本信息与配套文档。
 
 ## 修订记录

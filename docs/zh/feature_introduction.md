@@ -225,7 +225,7 @@ void ggml_compute_forward_fused_cpp_sdpa_ext(const struct ggml_compute_params * 
 ## 验收标准
 
 - 功能正确性：优化后各kernel输出与官方llama.cpp输出在指定测试数据集上的余弦相似度大于0.999，或C-MTEB所有数据集平均得分掉点小于1%，且通过脚本实现精度验证。
-- 性能：各kernel优化后，在基准测试中端到端性能达成预期加速比（具体平台的性能数据请参见《[技术报告](./technical_report.md)》）。
+- 性能：各kernel优化后，在基准测试中端到端性能达成预期加速比。
 
 ## 修订记录
 

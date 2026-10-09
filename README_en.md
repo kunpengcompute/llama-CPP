@@ -37,7 +37,6 @@ llama-CPP/
 │   │   ├── release_notes.md                      # Release Notes
 │   │   ├── user_guide.md                         # User Guide
 │   │   ├── unit_test_guide.md                    # Unit Test Guide
-│   │   ├── technical_report.md                   # Technical Report
 │   └── en                                        # English documentation directory
 │       ├── menu_llamacpp.md                      # Documentation navigation
 │       ├── feature_introduction.md               # Feature Guide
@@ -64,7 +63,6 @@ For details about the llama-CPP release notes, see [Release Notes](./docs/en/rel
 | [Feature Introduction](./docs/en/feature_introduction.md) | Provides the llama-CPP optimization description. |
 | [User Guide](./docs/en/user_guide.md) | Provides instructions on using the llama-CPP optimizations. |
 | [Unit Test Guide](./docs/en/unit_test_guide.md) | Describes compilation, execution, and expected output of operator optimization unit tests. |
-| [Technical Report](./docs/en/technical_report.md) | Provides accuracy and performance verification data. |
 | [Quick Start](./docs/en/quick_start.md) | Provides a quick guide to checking out the official llama.cpp code (commit <code>3ac67535c86</code>), applying the optimization patches, and performing compilation. |
 
 ## Quick Start
