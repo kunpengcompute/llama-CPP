@@ -4,4 +4,3 @@
 - [用户指南](./user_guide.md)
 - [快速入门](./quick_start.md)
 - [单元测试指南](./unit_test_guide.md)
-- [技术报告](./technical_report.md)

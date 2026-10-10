@@ -37,7 +37,6 @@ llama-CPP/
 │   │   ├── release_notes.md                      # 版本说明书
 │   │   ├── user_guide.md                         # 用户指南
 │   │   ├── unit_test_guide.md                    # 单元测试指南
-│   │   ├── technical_report.md                   # 技术报告
 │   └── en                                        # English document directory
 │       ├── menu_llamacpp.md                      # 英文文档导航
 │       ├── feature_introduction.md               # feature_introduction
@@ -64,7 +63,6 @@ llama-CPP版本说明，请参见《[版本说明书](./docs/zh/release_notes.md
 | [特性介绍](./docs/zh/feature_introduction.md) | 提供llama-CPP优化说明。 |
 | [用户指南](./docs/zh/user_guide.md) | 提供llama-CPP优化使用说明。 |
 | [单元测试指南](./docs/zh/unit_test_guide.md) | 提供算子优化单元测试的编译、执行与预期输出说明。 |
-| [技术报告](./docs/zh/technical_report.md) | 提供精度与性能验证数据。 |
 | [快速入门](./docs/zh/quick_start.md) | 提供基于官方llama.cpp（commit `3ac67535c86`）checkout代码、合入优化补丁与编译的快速指南。 |
 
 ## 快速入门

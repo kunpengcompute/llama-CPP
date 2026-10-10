@@ -278,7 +278,7 @@ CFLAGS+=-DGGML_USE_FUSED_CPP_SDPA
 
 - Functional correctness: After optimization, the cosine similarity between each kernel's output and the official llama.cpp output on the specified test dataset is greater than 0.999, or the average score drop across all C-MTEB datasets is less than 1%, and the result passes the script-based accuracy verification.
 
-- Performance: After optimization, each kernel achieves the expected end-to-end speedup in benchmark tests (for platform-specific performance data, see [Technical Report](./technical_report.md)).
+- Performance: After optimization, each kernel achieves the expected end-to-end speedup in benchmark tests (for platform-specific performance data.
 
 ## Change History
 

@@ -1,4 +1,4 @@
-From b94f920db0c16be10d7e0d4c7013b887868eea6f Mon Sep 17 00:00:00 2001
+From 7d456d00e7e15d89392d9f433dc3bb0ca0ecec33 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:19:07 +0800
 Subject: [PATCH 03/11] feat(cpu): add Q8_0 MMLA spack matmul kernels
@@ -10,12 +10,12 @@ Subject: [PATCH 03/11] feat(cpu): add Q8_0 MMLA spack matmul kernels
   4x4-tiled padded entry; split the hot kernel into its own noinline
   function to avoid GCC ICE under heavy inlining
 ---
- ggml/src/ggml-cpu/ggml-cpu-quants.c | 1827 ++++++++++++++++++++++++++-
- ggml/src/ggml-cpu/ggml-cpu-quants.h |  120 +-
- 2 files changed, 1945 insertions(+), 2 deletions(-)
+ ggml/src/ggml-cpu/ggml-cpu-quants.c | 1831 ++++++++++++++++++++++++++-
+ ggml/src/ggml-cpu/ggml-cpu-quants.h |  123 +-
+ 2 files changed, 1952 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cpu/ggml-cpu-quants.c b/ggml/src/ggml-cpu/ggml-cpu-quants.c
-index 40bded47..8e5af3e4 100644
+index 40bded47..0ecd4403 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu-quants.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu-quants.c
 @@ -13,7 +13,8 @@
@@ -28,10 +28,12 @@ index 40bded47..8e5af3e4 100644
  #define GROUP_MAX_EPS 1e-15f
  #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
  #define GROUP_MAX_EPS_IQ2_S 1e-8f
-@@ -4008,6 +4009,1830 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -4008,6 +4009,1834 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
      *s = sumf;
  }
  
++
++#if defined(__ARM_FEATURE_SVE)
 +
 +void
 +matmul_q8_0_mmla_spack_destroy(matmul_q8_0_mmla_spack_t* spack)
@@ -1856,11 +1858,13 @@ index 40bded47..8e5af3e4 100644
 +    return &C[col * c_stride + row];
 +}
 +
++#endif // defined(__ARM_FEATURE_SVE)
++
  void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
      assert(nrc == 1);
      UNUSED(nrc);
 diff --git a/ggml/src/ggml-cpu/ggml-cpu-quants.h b/ggml/src/ggml-cpu/ggml-cpu-quants.h
-index e33d9d47..04fb648d 100644
+index e33d9d47..c00bc3fc 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu-quants.h
 +++ b/ggml/src/ggml-cpu/ggml-cpu-quants.h
 @@ -4,7 +4,9 @@
@@ -1874,11 +1878,12 @@ index e33d9d47..04fb648d 100644
  // GGML CPU internal header
  
  #ifdef __cplusplus
-@@ -58,6 +60,122 @@ void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const
+@@ -58,6 +60,125 @@ void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const
  void ggml_vec_dot_iq4_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq3_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  
 +// mmla
++#if defined(__ARM_FEATURE_SVE)
 +static size_t g_chunk_size_q8_0_mmla_spack = 1024;
 +typedef struct matmul_q8_0_mmla_spack_t
 +{
@@ -1994,6 +1999,11 @@ index e33d9d47..04fb648d 100644
 +    matmul_q8_0_mmla_spack_b(na, nb, dim, a, b, c, c_column_bytes, matmul_q8_0_mmla_8x8_b_micro_spack_neon);
 +}
 +
++#endif // defined(__ARM_FEATURE_SVE)
++
  #ifdef __cplusplus
  }
  #endif
+-- 
+2.43.0
+
