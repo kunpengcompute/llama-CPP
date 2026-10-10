@@ -1,4 +1,4 @@
-From 4e02a0da109cbc96641695829f328579116a4d36 Mon Sep 17 00:00:00 2001
+From 565450c7ba4eba1ce49d50abd6910d9d1e4bedf7 Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:18:57 +0800
 Subject: [PATCH 02/11] feat(cpu): add ARM SVE/NEON FP16 & FP32 matmul kernels
@@ -13,9 +13,9 @@ Subject: [PATCH 02/11] feat(cpu): add ARM SVE/NEON FP16 & FP32 matmul kernels
     so leftover elements past the first vector are always covered
 ---
  ggml/include/ggml-cpu.h   |   16 +
- ggml/src/ggml-cpu/vec.cpp | 1779 ++++++++++++++++++++++++++++++++++++-
- ggml/src/ggml-cpu/vec.h   |  116 ++-
- 3 files changed, 1885 insertions(+), 26 deletions(-)
+ ggml/src/ggml-cpu/vec.cpp | 1434 ++++++++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cpu/vec.h   |  120 +++-
+ 3 files changed, 1564 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
 index de77a875..562adfac 100644
@@ -52,7 +52,7 @@ index de77a875..562adfac 100644
  
      GGML_BACKEND_API void ggml_cpu_init(void);
 diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
-index f7614568..06f4d89e 100644
+index f7614568..62857cda 100644
 --- a/ggml/src/ggml-cpu/vec.cpp
 +++ b/ggml/src/ggml-cpu/vec.cpp
 @@ -2,6 +2,12 @@
@@ -85,120 +85,12 @@ index f7614568..06f4d89e 100644
          }
          // reduce sum1,sum2 to sum1
          GGML_F32_VEC_REDUCE(sumf, sum1, sum2, sum3, sum4, sum5, sum6, sum7, sum8);
-@@ -195,39 +203,1766 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
-     GGML_UNUSED(by);
-     GGML_UNUSED(bs);
+@@ -230,6 +238,1428 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
+     *s = sumf;
+ }
  
--    ggml_float sumf = 0.0;
-+    // NEON optimized path: process 64 fp16 elements at a time with 8 NEON registers
-+    // Software pipeline to hide load latency
-+    const int np = (n & ~((1 << 6) - 1)); // 64-element aligned
- 
--#if defined(GGML_SIMD)
--    const int np = (n & ~(GGML_F16_STEP - 1));
-+    float16x8_t acc0 = vdupq_n_f16(0);
-+    float16x8_t acc1 = vdupq_n_f16(0);
-+    float16x8_t acc2 = vdupq_n_f16(0);
-+    float16x8_t acc3 = vdupq_n_f16(0);
-+    float16x8_t acc4 = vdupq_n_f16(0);
-+    float16x8_t acc5 = vdupq_n_f16(0);
-+    float16x8_t acc6 = vdupq_n_f16(0);
-+    float16x8_t acc7 = vdupq_n_f16(0);
++#if defined(__ARM_FEATURE_SVE)
 +
-+    // Pre-load first 64 elements
-+    float16x8_t ax0 = vld1q_f16((const __fp16 *)(x + 0));
-+    float16x8_t ax1 = vld1q_f16((const __fp16 *)(x + 8));
-+    float16x8_t ax2 = vld1q_f16((const __fp16 *)(x + 16));
-+    float16x8_t ax3 = vld1q_f16((const __fp16 *)(x + 24));
-+    float16x8_t ax4 = vld1q_f16((const __fp16 *)(x + 32));
-+    float16x8_t ax5 = vld1q_f16((const __fp16 *)(x + 40));
-+    float16x8_t ax6 = vld1q_f16((const __fp16 *)(x + 48));
-+    float16x8_t ax7 = vld1q_f16((const __fp16 *)(x + 56));
-+
-+    float16x8_t ay0 = vld1q_f16((const __fp16 *)(y + 0));
-+    float16x8_t ay1 = vld1q_f16((const __fp16 *)(y + 8));
-+    float16x8_t ay2 = vld1q_f16((const __fp16 *)(y + 16));
-+    float16x8_t ay3 = vld1q_f16((const __fp16 *)(y + 24));
-+    float16x8_t ay4 = vld1q_f16((const __fp16 *)(y + 32));
-+    float16x8_t ay5 = vld1q_f16((const __fp16 *)(y + 40));
-+    float16x8_t ay6 = vld1q_f16((const __fp16 *)(y + 48));
-+    float16x8_t ay7 = vld1q_f16((const __fp16 *)(y + 56));
-+
-+    int i = 64;
-+    for (; i < np; i += 64) {
-+        // Software pipeline: compute with previous data, load next
-+        acc0 = vfmaq_f16(acc0, ax0, ay0);
-+        ax0 = vld1q_f16((const __fp16 *)(x + i + 0));
-+        ay0 = vld1q_f16((const __fp16 *)(y + i + 0));
-+
-+        acc1 = vfmaq_f16(acc1, ax1, ay1);
-+        ax1 = vld1q_f16((const __fp16 *)(x + i + 8));
-+        ay1 = vld1q_f16((const __fp16 *)(y + i + 8));
-+
-+        acc2 = vfmaq_f16(acc2, ax2, ay2);
-+        ax2 = vld1q_f16((const __fp16 *)(x + i + 16));
-+        ay2 = vld1q_f16((const __fp16 *)(y + i + 16));
-+
-+        acc3 = vfmaq_f16(acc3, ax3, ay3);
-+        ax3 = vld1q_f16((const __fp16 *)(x + i + 24));
-+        ay3 = vld1q_f16((const __fp16 *)(y + i + 24));
-+
-+        acc4 = vfmaq_f16(acc4, ax4, ay4);
-+        ax4 = vld1q_f16((const __fp16 *)(x + i + 32));
-+        ay4 = vld1q_f16((const __fp16 *)(y + i + 32));
-+
-+        acc5 = vfmaq_f16(acc5, ax5, ay5);
-+        ax5 = vld1q_f16((const __fp16 *)(x + i + 40));
-+        ay5 = vld1q_f16((const __fp16 *)(y + i + 40));
-+
-+        acc6 = vfmaq_f16(acc6, ax6, ay6);
-+        ax6 = vld1q_f16((const __fp16 *)(x + i + 48));
-+        ay6 = vld1q_f16((const __fp16 *)(y + i + 48));
-+
-+        acc7 = vfmaq_f16(acc7, ax7, ay7);
-+        ax7 = vld1q_f16((const __fp16 *)(x + i + 56));
-+        ay7 = vld1q_f16((const __fp16 *)(y + i + 56));
-+    }
- 
--    GGML_F16_VEC sum[GGML_F16_ARR] = { GGML_F16_VEC_ZERO };
-+    // Epilogue: process last block (already loaded, no more loads)
-+    acc0 = vfmaq_f16(acc0, ax0, ay0);
-+    acc1 = vfmaq_f16(acc1, ax1, ay1);
-+    acc2 = vfmaq_f16(acc2, ax2, ay2);
-+    acc3 = vfmaq_f16(acc3, ax3, ay3);
-+    acc4 = vfmaq_f16(acc4, ax4, ay4);
-+    acc5 = vfmaq_f16(acc5, ax5, ay5);
-+    acc6 = vfmaq_f16(acc6, ax6, ay6);
-+    acc7 = vfmaq_f16(acc7, ax7, ay7);
- 
--    GGML_F16_VEC ax[GGML_F16_ARR];
--    GGML_F16_VEC ay[GGML_F16_ARR];
-+    // Horizontal sum: sum all 8 acc vectors into one scalar
-+    float16x8_t sum = vpaddq_f16(acc0, acc1);
-+    float16x8_t sum2 = vpaddq_f16(acc2, acc3);
-+    float16x8_t sum3 = vpaddq_f16(acc4, acc5);
-+    float16x8_t sum4 = vpaddq_f16(acc6, acc7);
-+    sum = vpaddq_f16(sum, sum2);
-+    sum3 = vpaddq_f16(sum3, sum4);
-+    sum = vpaddq_f16(sum, sum3);
-+    // Now sum has 8 partial sums, need one more step
-+    float32_t r0 = vaddvq_f32(vcvt_f32_f16(vget_low_f16(sum))) +
-+                   vaddvq_f32(vcvt_f32_f16(vget_high_f16(sum)));
-+    ggml_float sumf = (ggml_float)r0;
- 
--    for (int i = 0; i < np; i += GGML_F16_STEP) {
--        for (int j = 0; j < GGML_F16_ARR; j++) {
--            ax[j] = GGML_F16_VEC_LOAD(x + i + j*GGML_F16_EPR, j);
--            ay[j] = GGML_F16_VEC_LOAD(y + i + j*GGML_F16_EPR, j);
-+    // leftovers (0-63 elements)
-+    for (int i2 = np; i2 < n; ++i2) {
-+        sumf += (ggml_float)(GGML_FP16_TO_FP32(x[i2])*GGML_FP16_TO_FP32(y[i2]));
-+    }
-+
-+    *s = (float)sumf;
-+}
- 
--            sum[j] = GGML_F16_VEC_FMA(sum[j], ax[j], ay[j]);
 +float16x8_t svget_neonq_f16(svfloat16_t sve_vec) {
 +    // return svget_neonq(sve_vec);
 +    float16_t v[svcnth()];
@@ -321,262 +213,9 @@ index f7614568..06f4d89e 100644
 +    for (size_t i = N_rounded; i < N; i++) {
 +        for (size_t j = 0; j < M; j++) {
 +            ggml_vec_dot_f32(dim, &C[(i * c_stride) + j], 0, &A[j * dim], 0, &B[i * dim], 0, 1);
-         }
-     }
-+}
-+
-+// Performance-first SVE 1x8 kernel for fixed 256-bit SVE
-+// Assumption: SVE vector length = 256-bit = 16 fp16 lanes
-+// M == 1 decode fast path
-+static inline void
-+ggml_matmul_f16_1xn_kernel_sve(size_t N, size_t K,
-+                               const ggml_fp16_t * GGML_RESTRICT A,
-+                               const ggml_fp16_t * GGML_RESTRICT B,
-+                               float32_t * GGML_RESTRICT C,
-+                               size_t c_stride) {
-+    const svbool_t pg = svptrue_b16();
-+
-+    // 256-bit SVE: 16 fp16 lanes
-+    const size_t K_STEP  = 16;
-+    const size_t K_STEP2 = 32;
-+
-+    const size_t K_rounded2 = K & ~(K_STEP2 - 1);
-+    const size_t K_rounded1 = K & ~(K_STEP  - 1);
- 
--    // reduce sum0..sum3 to sum0
--    GGML_F16_VEC_REDUCE(sumf, sum);
-+    size_t i = 0;
- 
--    // leftovers
--    for (int i = np; i < n; ++i) {
--        sumf += (ggml_float)(GGML_FP16_TO_FP32(x[i])*GGML_FP16_TO_FP32(y[i]));
-+    // Main path: compute 8 output channels at once.
-+    // This reuses one A vector for 8 B rows.
-+    for (; i + 8 <= N; i += 8) {
-+        svfloat16_t acc0 = svdup_f16(0.0f);
-+        svfloat16_t acc1 = svdup_f16(0.0f);
-+        svfloat16_t acc2 = svdup_f16(0.0f);
-+        svfloat16_t acc3 = svdup_f16(0.0f);
-+        svfloat16_t acc4 = svdup_f16(0.0f);
-+        svfloat16_t acc5 = svdup_f16(0.0f);
-+        svfloat16_t acc6 = svdup_f16(0.0f);
-+        svfloat16_t acc7 = svdup_f16(0.0f);
-+
-+        size_t k = 0;
-+
-+        // Unroll K by 2 vectors to reduce loop overhead and give compiler more scheduling room.
-+        for (; k < K_rounded2; k += K_STEP2) {
-+            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
-+
-+            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k]);
-+            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k]);
-+            svfloat16_t b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k]);
-+            svfloat16_t b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k]);
-+            svfloat16_t b4 = svld1_f16(pg, (const __fp16 *) &B[(i + 4) * K + k]);
-+            svfloat16_t b5 = svld1_f16(pg, (const __fp16 *) &B[(i + 5) * K + k]);
-+            svfloat16_t b6 = svld1_f16(pg, (const __fp16 *) &B[(i + 6) * K + k]);
-+            svfloat16_t b7 = svld1_f16(pg, (const __fp16 *) &B[(i + 7) * K + k]);
-+
-+            acc0 = svmla_f16_m(pg, acc0, a0, b0);
-+            acc1 = svmla_f16_m(pg, acc1, a0, b1);
-+            acc2 = svmla_f16_m(pg, acc2, a0, b2);
-+            acc3 = svmla_f16_m(pg, acc3, a0, b3);
-+            acc4 = svmla_f16_m(pg, acc4, a0, b4);
-+            acc5 = svmla_f16_m(pg, acc5, a0, b5);
-+            acc6 = svmla_f16_m(pg, acc6, a0, b6);
-+            acc7 = svmla_f16_m(pg, acc7, a0, b7);
-+
-+            svfloat16_t a1 = svld1_f16(pg, (const __fp16 *) &A[k + K_STEP]);
-+
-+            b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k + K_STEP]);
-+            b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k + K_STEP]);
-+            b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k + K_STEP]);
-+            b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k + K_STEP]);
-+            b4 = svld1_f16(pg, (const __fp16 *) &B[(i + 4) * K + k + K_STEP]);
-+            b5 = svld1_f16(pg, (const __fp16 *) &B[(i + 5) * K + k + K_STEP]);
-+            b6 = svld1_f16(pg, (const __fp16 *) &B[(i + 6) * K + k + K_STEP]);
-+            b7 = svld1_f16(pg, (const __fp16 *) &B[(i + 7) * K + k + K_STEP]);
-+
-+            acc0 = svmla_f16_m(pg, acc0, a1, b0);
-+            acc1 = svmla_f16_m(pg, acc1, a1, b1);
-+            acc2 = svmla_f16_m(pg, acc2, a1, b2);
-+            acc3 = svmla_f16_m(pg, acc3, a1, b3);
-+            acc4 = svmla_f16_m(pg, acc4, a1, b4);
-+            acc5 = svmla_f16_m(pg, acc5, a1, b5);
-+            acc6 = svmla_f16_m(pg, acc6, a1, b6);
-+            acc7 = svmla_f16_m(pg, acc7, a1, b7);
 +        }
-+
-+        // One remaining full SVE vector.
-+        if (k < K_rounded1) {
-+            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
-+
-+            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k]);
-+            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k]);
-+            svfloat16_t b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k]);
-+            svfloat16_t b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k]);
-+            svfloat16_t b4 = svld1_f16(pg, (const __fp16 *) &B[(i + 4) * K + k]);
-+            svfloat16_t b5 = svld1_f16(pg, (const __fp16 *) &B[(i + 5) * K + k]);
-+            svfloat16_t b6 = svld1_f16(pg, (const __fp16 *) &B[(i + 6) * K + k]);
-+            svfloat16_t b7 = svld1_f16(pg, (const __fp16 *) &B[(i + 7) * K + k]);
-+
-+            acc0 = svmla_f16_m(pg, acc0, a0, b0);
-+            acc1 = svmla_f16_m(pg, acc1, a0, b1);
-+            acc2 = svmla_f16_m(pg, acc2, a0, b2);
-+            acc3 = svmla_f16_m(pg, acc3, a0, b3);
-+            acc4 = svmla_f16_m(pg, acc4, a0, b4);
-+            acc5 = svmla_f16_m(pg, acc5, a0, b5);
-+            acc6 = svmla_f16_m(pg, acc6, a0, b6);
-+            acc7 = svmla_f16_m(pg, acc7, a0, b7);
-+
-+            k += K_STEP;
-+        }
-+
-+        // K tail: 1..15 fp16
-+        if (k < K) {
-+            svbool_t pg_tail = svwhilelt_b16(k, K);
-+
-+            svfloat16_t a0 = svld1_f16(pg_tail, (const __fp16 *) &A[k]);
-+
-+            svfloat16_t b0 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 0) * K + k]);
-+            svfloat16_t b1 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 1) * K + k]);
-+            svfloat16_t b2 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 2) * K + k]);
-+            svfloat16_t b3 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 3) * K + k]);
-+            svfloat16_t b4 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 4) * K + k]);
-+            svfloat16_t b5 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 5) * K + k]);
-+            svfloat16_t b6 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 6) * K + k]);
-+            svfloat16_t b7 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 7) * K + k]);
-+
-+            acc0 = svmla_f16_m(pg_tail, acc0, a0, b0);
-+            acc1 = svmla_f16_m(pg_tail, acc1, a0, b1);
-+            acc2 = svmla_f16_m(pg_tail, acc2, a0, b2);
-+            acc3 = svmla_f16_m(pg_tail, acc3, a0, b3);
-+            acc4 = svmla_f16_m(pg_tail, acc4, a0, b4);
-+            acc5 = svmla_f16_m(pg_tail, acc5, a0, b5);
-+            acc6 = svmla_f16_m(pg_tail, acc6, a0, b6);
-+            acc7 = svmla_f16_m(pg_tail, acc7, a0, b7);
-+        }
-+
-+        C[(i + 0) * c_stride] = (float) svaddv_f16(pg, acc0);
-+        C[(i + 1) * c_stride] = (float) svaddv_f16(pg, acc1);
-+        C[(i + 2) * c_stride] = (float) svaddv_f16(pg, acc2);
-+        C[(i + 3) * c_stride] = (float) svaddv_f16(pg, acc3);
-+        C[(i + 4) * c_stride] = (float) svaddv_f16(pg, acc4);
-+        C[(i + 5) * c_stride] = (float) svaddv_f16(pg, acc5);
-+        C[(i + 6) * c_stride] = (float) svaddv_f16(pg, acc6);
-+        C[(i + 7) * c_stride] = (float) svaddv_f16(pg, acc7);
-     }
--#else
--    for (int i = 0; i < n; ++i) {
--        sumf += (ggml_float)(GGML_FP16_TO_FP32(x[i])*GGML_FP16_TO_FP32(y[i]));
-+
-+    // N tail: 4 outputs at once.
-+    for (; i + 4 <= N; i += 4) {
-+        svfloat16_t acc0 = svdup_f16(0.0f);
-+        svfloat16_t acc1 = svdup_f16(0.0f);
-+        svfloat16_t acc2 = svdup_f16(0.0f);
-+        svfloat16_t acc3 = svdup_f16(0.0f);
-+
-+        size_t k = 0;
-+
-+        for (; k < K_rounded2; k += K_STEP2) {
-+            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
-+
-+            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k]);
-+            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k]);
-+            svfloat16_t b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k]);
-+            svfloat16_t b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k]);
-+
-+            acc0 = svmla_f16_m(pg, acc0, a0, b0);
-+            acc1 = svmla_f16_m(pg, acc1, a0, b1);
-+            acc2 = svmla_f16_m(pg, acc2, a0, b2);
-+            acc3 = svmla_f16_m(pg, acc3, a0, b3);
-+
-+            svfloat16_t a1 = svld1_f16(pg, (const __fp16 *) &A[k + K_STEP]);
-+
-+            b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k + K_STEP]);
-+            b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k + K_STEP]);
-+            b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k + K_STEP]);
-+            b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k + K_STEP]);
-+
-+            acc0 = svmla_f16_m(pg, acc0, a1, b0);
-+            acc1 = svmla_f16_m(pg, acc1, a1, b1);
-+            acc2 = svmla_f16_m(pg, acc2, a1, b2);
-+            acc3 = svmla_f16_m(pg, acc3, a1, b3);
-+        }
-+
-+        if (k < K_rounded1) {
-+            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
-+
-+            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[(i + 0) * K + k]);
-+            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[(i + 1) * K + k]);
-+            svfloat16_t b2 = svld1_f16(pg, (const __fp16 *) &B[(i + 2) * K + k]);
-+            svfloat16_t b3 = svld1_f16(pg, (const __fp16 *) &B[(i + 3) * K + k]);
-+
-+            acc0 = svmla_f16_m(pg, acc0, a0, b0);
-+            acc1 = svmla_f16_m(pg, acc1, a0, b1);
-+            acc2 = svmla_f16_m(pg, acc2, a0, b2);
-+            acc3 = svmla_f16_m(pg, acc3, a0, b3);
-+
-+            k += K_STEP;
-+        }
-+
-+        if (k < K) {
-+            svbool_t pg_tail = svwhilelt_b16(k, K);
-+
-+            svfloat16_t a0 = svld1_f16(pg_tail, (const __fp16 *) &A[k]);
-+
-+            svfloat16_t b0 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 0) * K + k]);
-+            svfloat16_t b1 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 1) * K + k]);
-+            svfloat16_t b2 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 2) * K + k]);
-+            svfloat16_t b3 = svld1_f16(pg_tail, (const __fp16 *) &B[(i + 3) * K + k]);
-+
-+            acc0 = svmla_f16_m(pg_tail, acc0, a0, b0);
-+            acc1 = svmla_f16_m(pg_tail, acc1, a0, b1);
-+            acc2 = svmla_f16_m(pg_tail, acc2, a0, b2);
-+            acc3 = svmla_f16_m(pg_tail, acc3, a0, b3);
-+        }
-+
-+        C[(i + 0) * c_stride] = (float) svaddv_f16(pg, acc0);
-+        C[(i + 1) * c_stride] = (float) svaddv_f16(pg, acc1);
-+        C[(i + 2) * c_stride] = (float) svaddv_f16(pg, acc2);
-+        C[(i + 3) * c_stride] = (float) svaddv_f16(pg, acc3);
-+    }
-+
-+    // Final N tail: 1 output at once, still SVE, no scalar fallback.
-+    for (; i < N; i++) {
-+        svfloat16_t acc = svdup_f16(0.0f);
-+
-+        size_t k = 0;
-+
-+        for (; k < K_rounded2; k += K_STEP2) {
-+            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
-+            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[i * K + k]);
-+            acc = svmla_f16_m(pg, acc, a0, b0);
-+
-+            svfloat16_t a1 = svld1_f16(pg, (const __fp16 *) &A[k + K_STEP]);
-+            svfloat16_t b1 = svld1_f16(pg, (const __fp16 *) &B[i * K + k + K_STEP]);
-+            acc = svmla_f16_m(pg, acc, a1, b1);
-+        }
-+
-+        if (k < K_rounded1) {
-+            svfloat16_t a0 = svld1_f16(pg, (const __fp16 *) &A[k]);
-+            svfloat16_t b0 = svld1_f16(pg, (const __fp16 *) &B[i * K + k]);
-+            acc = svmla_f16_m(pg, acc, a0, b0);
-+            k += K_STEP;
-+        }
-+
-+        if (k < K) {
-+            svbool_t pg_tail = svwhilelt_b16(k, K);
-+            svfloat16_t a0 = svld1_f16(pg_tail, (const __fp16 *) &A[k]);
-+            svfloat16_t b0 = svld1_f16(pg_tail, (const __fp16 *) &B[i * K + k]);
-+            acc = svmla_f16_m(pg_tail, acc, a0, b0);
-+        }
-+
-+        C[i * c_stride] = (float) svaddv_f16(pg, acc);
 +    }
 +}
-+
 +
 +void ggml_matmul_f16_4x4_kernel(size_t na, size_t nb, int dim,
 +                   const void* GGML_RESTRICT a, const void* GGML_RESTRICT b,
@@ -622,7 +261,7 @@ index f7614568..06f4d89e 100644
 +        }
 +
 +        return;
-     }
++    }
 +
 +    size_t N_rounded = N & ~((1 << 2) - 1);
 +    size_t M_rounded = M & ~((1 << 2) - 1);
@@ -1768,7 +1407,7 @@ index f7614568..06f4d89e 100644
 +                            (uint32_t*)&pack->p[i * pack->p_stride + ki * sizeof(uint32_t) * 4],
 +                            svcreate4_u32(row0, row1, row2, row3));
 +            }
- #endif
++#endif
 +            i += 4;
 +        } else if(el_bits == 16) {
 +            if (K < svcnth()) {
@@ -1822,8 +1461,7 @@ index f7614568..06f4d89e 100644
 +    }
 +    *out = pack;
 +}
- 
--    *s = sumf;
++
 +void
 +matmul_outer_packA_b(size_t na,
 +                     size_t nb,
@@ -1869,17 +1507,25 @@ index f7614568..06f4d89e 100644
 +        }
 +    }
 +    matmul_outer_packA_destroy(pack_a);
- }
- 
++}
++
++#endif // defined(__ARM_FEATURE_SVE)
++
  void ggml_vec_silu_f32(const int n, float * y, const float * x) {
+     int i = 0;
+ #if defined(__AVX512F__) && defined(__AVX512DQ__)
 diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
-index 09dbade2..c4bb0f23 100644
+index 09dbade2..87117c77 100644
 --- a/ggml/src/ggml-cpu/vec.h
 +++ b/ggml/src/ggml-cpu/vec.h
-@@ -43,6 +43,107 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
+@@ -43,6 +43,111 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
  void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc);
  void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
  
++static size_t g_chunk_size_outer_packA = 128;
++
++#if defined(__ARM_FEATURE_SVE)
++
 +void ggml_matmul_f32_4x4_kernel(size_t na, size_t nb, int dim, const void* GGML_RESTRICT a, const void* GGML_RESTRICT b, void* GGML_RESTRICT c, size_t c_column_bytes);
 +void ggml_matmul_f16_4x4_kernel(size_t na, size_t nb, int dim, const void* GGML_RESTRICT a, const void* GGML_RESTRICT b, void* GGML_RESTRICT c, size_t c_column_bytes);
 +
@@ -1890,8 +1536,6 @@ index 09dbade2..c4bb0f23 100644
 +                                       const matmul_outer_pack_t* pack_b,
 +                                       void* GGML_RESTRICT c,
 +                                       size_t c_column_bytes);
-+
-+static size_t g_chunk_size_outer_packA = 128;
 +
 +typedef void (*matmul_outer_packA_func)(size_t M,
 +                                        size_t N,
@@ -1981,10 +1625,12 @@ index 09dbade2..c4bb0f23 100644
 +    matmul_outer_packA_b(na, nb, dim, 16, a, b, c, c_column_bytes, matmul_outer_8x16_b_micro_packA_f16);
 +}
 +
++#endif // defined(__ARM_FEATURE_SVE)
++
  void ggml_vec_silu_f32(const int n, float * y, const float * x);
  ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max);
  ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, float max);
-@@ -376,11 +477,18 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
+@@ -376,11 +481,18 @@ inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
          }
          // leftovers
          // maximum number of leftover elements will be less that ggml_f32_epr. Apply predicated svmad on available elements only
@@ -2007,3 +1653,6 @@ index 09dbade2..c4bb0f23 100644
          }
      #else
          const int np = (n & ~(GGML_F32_STEP - 1));
+-- 
+2.43.0
+

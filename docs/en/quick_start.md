@@ -67,7 +67,6 @@ After compilation is complete, you can run unit tests to verify the correctness 
 - [User Guide](./user_guide.md): Deployment and tuning of embedding models such as bge-m3.
 - [Feature Introduction](./feature_introduction.md): Features and principles of the optimized operators.
 - [Unit Test Guide](./unit_test_guide.md): Compilation, execution, and expected output of unit tests.
-- [Technical Report](./technical_report.md): Accuracy and performance verification data.
 - [Release Notes](./release_notes.md): Release version information and related documents.
 
 ## Change History

@@ -1,4 +1,4 @@
-From e670ba3d604f4c77caff085c0362f2db4458fce6 Mon Sep 17 00:00:00 2001
+From 9dc5f8d0ba3a6e6cdb29ee1f2b72a665147a57ac Mon Sep 17 00:00:00 2001
 From: Kaixin Liu <liukaixin1@h-partners.com>
 Date: Thu, 6 Aug 2026 16:19:24 +0800
 Subject: [PATCH 04/11] feat(cpu): add fused SDPA microkernels (neon cache + QK
@@ -4389,3 +4389,6 @@ index 00000000..8ea1b934
 +}
 +
 +}  // namespace fused_cpp::sdpa_microkernels
+-- 
+2.43.0
+
