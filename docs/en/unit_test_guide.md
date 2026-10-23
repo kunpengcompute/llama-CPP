@@ -64,7 +64,8 @@ The test triggers the following optimized kernels (Arm/NEON) through the real gg
 | F32 GEMM | `ggml_matmul_f32_4x4_kernel` |
 | Fused SDPA | `ggml_compute_forward_fused_cpp_sdpa_ext` -&gt; `fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp` / `..._mask_f16` / `..._mask_f32` |
 
-> ![icon-note](./public_sys-resources/icon-note.gif) **NOTE:** The `f16` and `q8_0` cases hit the NEON-accelerated GEMM kernels listed above; `f32` serves as the reference baseline for comparison.
+> ![icon-note](./public_sys-resources/icon-note.gif) **NOTE:** 
+The `f16` and `q8_0` cases hit the NEON-accelerated GEMM kernels listed above; `f32` serves as the reference baseline for comparison.
 
 ## Test Principles
 
@@ -78,7 +79,7 @@ The test uses a seeded pseudo-random function to generate reproducible synthetic
 
 ### GEMM Reference
 
-1. `reference_matmul()` reproduces the `ggml_mul_mat` convention:
+1. `reference_matmul()` reproduces the `ggml_mul_mat` convention.
 
    ```bash
    out[i][j] = Σ_k w[i][k] · act[j][k]
@@ -107,7 +108,8 @@ ctest --test-dir build-delivery -L fused-sdpa
 ctest --test-dir build-delivery -R test-sdpa-f16q80-opt
 ```
 
-> ![icon-note](./public_sys-resources/icon-note.gif) **NOTE**: `0` is returned if all test cases pass. `1` is returned if any test fails.
+> ![icon-note](./public_sys-resources/icon-note.gif) **NOTE**: 
+`0` is returned if all test cases pass. `1` is returned if any test fails.
 
 ## Expected Test Output
 

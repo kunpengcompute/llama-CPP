@@ -25,7 +25,7 @@
 
 llama-CPP is a collection of CPU operator performance optimization patches for Kunpeng 950 processors/new Kunpeng 920 processor models. It focuses on the Arm matrix multiplication and attention operators of the llama.cpp inference engine's CPU backend. It uses the Arm NEON/SVE-256/i8mm instruction sets to implement Kunpeng-affinity optimizations, improving matrix multiplication and attention computation performance.
 
-Key optimizations include:
+Key optimizations include.
 
 - FP16 matrix multiplication optimization: NEON software-pipelined dot product, 4×4 outer-product tile, and outer-packA 8×16 hand-written outer-product kernels.
 - FP32 matrix multiplication optimization: SVE 4×4 tile kernel.

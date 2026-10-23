@@ -15,7 +15,7 @@ llama-CPP is a patch collection that optimizes the official llama.cpp repository
 | Kernel layer | Completely new | FP16/FP32/Q8_0 MatMul + fused SDPA (NEON/SVE/i8mm) |
 | Hardware layer | Unchanged | NEON, SVE-256 (256-bit), and i8mm; OpenMP parallelism; 64-byte-aligned memory |
 
-The data flow is as follows:
+The data flow is as follows.
 
 1. The application layer enters the inference loop through `llama_eval()`. The framework layer builds the GGML computation graph and schedules it via `ggml_graph_compute()`.
 2. The CPU backend selects an optimized kernel based on `vec_dot_type`.
@@ -29,7 +29,7 @@ For an embedding model with F16 weights, matrix multiplication mainly occurs dur
 
 1. Initialize eight `float16x8_t` accumulators (`acc0..acc7`).
 2. Preload the first 64 elements into `ax0..ax7`/`ay0..ay7`.
-3. Execute the main loop computation as follows:
+3. Execute the main loop computation as follows.
 
    ```bash
     (i=64; i<np; i+=64):
@@ -44,13 +44,13 @@ For an embedding model with F16 weights, matrix multiplication mainly occurs dur
 ### FP16 4×4 Tile Kernel (NEON Outer Product)
 
 1. For the `N==1` fast path: Loop over M rows with one `vfmaq_f16` execution per row to avoid function-call overhead.
-2. For the 4×4 tile main loop:
+2. For the 4×4 tile main loop.
    - Load `A[j..j+3][k..k+8]`, `B[i..i+3][k..k+8]`.
    - Perform 16 `vfmaq_f16` operations (`j0×i0..i3`, `j1×i0..i3`, ...).
    - Execute `vcvt_f32_f16` and `vaddvq_f32`, and write the result to matrix C.
 3. Batch process the M tail loop (1–3 rows); fall back to `vec_dot_f16` for the N tail loop.
 
->![icon-note](./public_sys-resources/icon-note.gif)**NOTE:**
+>![icon-note](./public_sys-resources/icon-note.gif) **NOTE:**
 >The FP16 4×4 tile kernel (NEON outer product) is suitable for small-batch prefill scenarios (M < 16).
 
 ### FP16 Outer-packA 8×16 Kernel (Hand-written NEON Outer Product for Large-Batch Prefill)
@@ -65,7 +65,7 @@ Input: packA (pre-packed A) with shape `[M_packed, K]` and B with shape `[N, K]`
 4. Execute fcvtl (f16 -&gt; f32) and write the result back to matrix C.
 5. The implementation result is located in `ggml/src/ggml-cpu/vec.cpp`/`vec.h`.
 
->![NOTE icon](./public_sys-resources/icon-note.gif)**NOTE:**
+>![NOTE icon](./public_sys-resources/icon-note.gif) **NOTE:**
 >By pre-packing A into 8×16 tiles (packA), this kernel maximizes register utilization and instruction-level parallelism. It is ideal for large-batch prefill scenarios (M >= 16).
 
 ## FP32 Matrix Multiplication Optimization
@@ -104,7 +104,7 @@ C        += float_sum
 
 Assume: outer tile: M=128 × N=64; K tile = 2048; micro tile = 8×8.
 
-The complete execution flow of Q8_0 MatMul is as follows:
+The complete execution flow of Q8_0 MatMul is as follows.
 
 1. Zero out C.
 2. Tile by M: Process at most 128 rows of A per iteration
@@ -116,14 +116,14 @@ The complete execution flow of Q8_0 MatMul is as follows:
    - Process one 8×8 C tile at a time (split into upper/lower 4×8 halves).
    - For each Q8_0 block, sequentially execute SMMLA on `K0..7`, `K8..15`, `K16..23`, and `K24..31`. Then convert the resulting int32 sum to FP32, multiply it by both the A scale and the B scale, and then accumulate the final FP32 product into C.
 
-The call flow of Q8_0 MatMul is as follows:
+The call flow of Q8_0 MatMul is as follows.
 
 1. `ggml_compute_forward_mul_mat()` calls `compute_forward_mul_mat_one_chunk_matmul_kernel()`.
 2. This function routes to the `matmul_q8_0_mmla_spack_b_g()` callback via `type_traits[Q8_0].matmul`.
 3. `matmul_q8_0_mmla_spack_b()` performs outer M/N/K tiling and A/B panel packing.
 4. Finally, `matmul_q8_0_mmla_8x8_b_micro_spack_neon()` is called to complete the micro-kernel computation.
 
->![icon-note](./public_sys-resources/icon-note.gif)**NOTE:**
+>![icon-note](./public_sys-resources/icon-note.gif) **NOTE:**
 >`type_traits[GGML_TYPE_Q8_0]` registers the `matmul_q8_0_mmla_spack_b_g` callback, and falls back to the generic kernel when the rows/columns do not satisfy tile alignment. The implementation is located in `ggml/src/ggml-cpu/ggml-cpu-quants.c` and `ggml/src/ggml-cpu/ggml-cpu-quants.h`, with routing registered in `ggml-cpu.c`.
 
 ## Fused SDPA (FlashAttention v2 NEON Fused Operator)
@@ -132,7 +132,7 @@ The official llama.cpp attention implementation executes QK<sup>T</sup>, scaling
 
 ### Integration Method
 
-This feature is controlled by the `GGML_USE_FUSED_CPP_SDPA` compilation macro. `build_attn_mha()` in `llama-graph.cpp` checks the following enabling conditions:
+This feature is controlled by the `GGML_USE_FUSED_CPP_SDPA` compilation macro. `build_attn_mha()` in `llama-graph.cpp` checks the following enabling conditions.
 
 - AArch64 platform; F32 Q/K/V; MHA (`n_head==n_head_kv`).
 - No MLA/ALiBi/attn_soft_cap.
@@ -142,7 +142,7 @@ When the conditions are met, `GGML_OP_FUSED_CPP_SDPA_EXT` is built to replace th
 
 ### Inference Flow
 
-The inference flow is as follows:
+The inference flow is as follows.
 
 1. `build_attn_mha()` is used to determine whether to use the fused SDPA path.
 2. When the enabling conditions are met, `GGML_OP_FUSED_CPP_SDPA_EXT` is built and `ggml_fused_cpp_sdpa_ext(q, k, v, mask, scale)` is called, which calls `fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp()` for full-matrix computation through `ggml_compute_forward_fused_cpp_sdpa_ext()` in `ops.cpp`.
