@@ -1,6 +1,8 @@
 # llama-CPP Introduction
 
-English|[简体中文](./README.md)
+<!-- md-trans-meta sourceCommit=e1ac8b37a522335e26bf40c54d19b864b30c9912 translatedAt=2026-10-21T03:38:59.184Z pushedAt=2026-10-22T01:36:12.941Z nl=2 -->
+
+English | [Chinese](./README.md)
 
 ## Latest Updates
 
@@ -55,7 +57,7 @@ llama-CPP/
 
 For details about the llama-CPP release notes, see [Release Notes](./docs/en/release_notes.md).
 
-## Related Documents
+## Documents
 
 | Document | Description |
 | ------------ | ------------ |

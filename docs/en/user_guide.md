@@ -1,18 +1,20 @@
 # llama.cpp-based BGE Model Tuning User Guide
 
+<!-- md-trans-meta sourceCommit=223b73cd2502a5a7952461cf862cfe3d58353352 translatedAt=2026-10-21T03:36:21.667Z pushedAt=2026-10-22T01:36:10.526Z nl=2 -->
+
 ## Tuning Overview
 
 This document provides tuning guidance based on Kunpeng 950 processors/new Kunpeng 920 processor models. It describes how to apply optimization patches and compile and deploy the code based on the official llama.cpp repository (commit `3ac67535c86`), as well as how to run embedding models such as bge-m3.
 
 ## Environment Requirements
 
-- Hardware platform: Kunpeng 950 processor/New Kunpeng 920 processor (NEON/SVE-256/i8mm).
+- Hardware platform: Kunpeng 950 processor/New Kunpeng 920 processor model (NEON/SVE-256/i8mm).
 - OS: openEuler 22.03 LTS SP3 or later.
 - Compiler: GCC/G++ 12.3.1 or later (compatibility with `armv8.6-a+dotprod+i8mm+sve` required).
-- Build dependencies: cmake >= 3.20, ninja (recommended), and git.
+- Build dependencies: CMake >= 3.20, Ninja (recommended), and Git.
 - Model selection: embedding models such as bge-m3 and bge-small-zh-v1.5 (FP16/Q8_0 GGUF format).
 
-## Optimization Patches
+## Optimization Patch Integration
 
 The optimization patches are based on the official llama.cpp repository (commit `3ac67535c86`).
 
@@ -21,7 +23,7 @@ The optimization patches are based on the official llama.cpp repository (commit 
    ```bash
    mkdir -p /home/code
    cd /home/code
-   git clone <llama-CPP_repository_address> && cd llama-CPP
+   git clone <llama-CPP repository address> && cd llama-CPP
    ```
 
 2. Apply the optimization patches.
@@ -38,8 +40,8 @@ Use `compile.sh` for one-click compilation (`compile.sh` is introduced together 
 ./compile.sh build-delivery
 ```
 
-> ![icon-note](./public_sys-resources/icon-note.gif)**NOTE:**
->By default, the compilation (`-O3 RelWithDebInfo`) builds ggml-cpu/llama-embedding/llama-bench/llama-server.
+> ![icon-note](./public_sys-resources/icon-note.gif) **NOTE:**
+> By default, the compilation (`-O3 RelWithDebInfo`) builds ggml-cpu/llama-embedding/llama-bench/llama-server.
 
 The compilation results are located in `build-delivery/bin/`.
 
@@ -103,7 +105,7 @@ Before accuracy verification, prepare the official llama.cpp source code (commit
    cmake -DCMAKE_BUILD_TYPE=Release \
                -B build-baseline-fixed -GNinja \
                -DLLAMA_CURL=OFF -DGGML_CCACHE=OFF
-   cmake --build build-baseline-fixed --target ggml-cpu llama-embedding llama-bench llama-server -j 20
+   cmake --build build-baseline-fixed --target ggml-cpu llama-embedding llama-bench llama-server -j 20 
    ```
 
 3. After starting the server with this version, verify accuracy using the following commands.
@@ -121,7 +123,7 @@ python eval_llamacpp_cmteb.py \
 --continue-on-error
 ```
 
-> ![icon-note](./public_sys-resources/icon-note.gif)**NOTE:**
+> ![icon-note](./public_sys-resources/icon-note.gif) **NOTE:**
 >
 >- Set the llama servers following `servers` in the format of `<server_name>=<server url>`. Multiple servers are separated by spaces.
 >- The number of server-workers equals the number of servers above; use one worker for each server being tested.
