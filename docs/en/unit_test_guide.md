@@ -1,5 +1,7 @@
 # Operator Optimization Unit Test Guide
 
+<!-- md-trans-meta sourceCommit=2b19947994ed4c2259131a8ac70a6812c3fa92cd translatedAt=2026-10-21T03:36:25.057Z pushedAt=2026-10-22T01:36:09.078Z nl=2 -->
+
 ## Test Introduction
 
 `tests/test-sdpa-f16q80-opt` is a correctness unit test based on synthetic (mock) data, used to verify two inference paths.
@@ -62,7 +64,8 @@ The test triggers the following optimized kernels (Arm/NEON) through the real gg
 | F32 GEMM | `ggml_matmul_f32_4x4_kernel` |
 | Fused SDPA | `ggml_compute_forward_fused_cpp_sdpa_ext` -&gt; `fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp` / `..._mask_f16` / `..._mask_f32` |
 
-> ![icon-note](./public_sys-resources/icon-note.gif)**NOTE:** The `f16` and `q8_0` cases hit the NEON-accelerated GEMM kernels listed above; `f32` serves as the reference baseline for comparison.
+> ![icon-note](./public_sys-resources/icon-note.gif) **NOTE:** 
+>The `f16` and `q8_0` cases hit the NEON-accelerated GEMM kernels listed above; `f32` serves as the reference baseline for comparison.
 
 ## Test Principles
 
@@ -96,7 +99,7 @@ cmake --build build-delivery --target test-sdpa-f16q80-opt -j
 cmake --build build-delivery -j
 ```
 
-## Testing
+## Starting the Test
 
 ```bash
 build-delivery/bin/test-sdpa-f16q80-opt
@@ -105,7 +108,8 @@ ctest --test-dir build-delivery -L fused-sdpa
 ctest --test-dir build-delivery -R test-sdpa-f16q80-opt
 ```
 
-> ![icon-note](./public_sys-resources/icon-note.gif)**NOTE:** `0` is returned if all test cases pass. `1` is returned if any test fails.
+> ![icon-note](./public_sys-resources/icon-note.gif) **NOTE**: 
+>`0` is returned if all test cases pass. `1` is returned if any test fails.
 
 ## Expected Test Output
 
