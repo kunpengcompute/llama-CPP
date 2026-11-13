@@ -1,5 +1,7 @@
 # 特性介绍
 
+本文档介绍llama-CPP优化补丁，涵盖面向鲲鹏950处理器/鲲鹏920新型号处理器的FP16、FP32、Q8_0矩阵乘法与Fused SDPA融合算子优化，并给出关键接口、编译运行辅助与验收标准，适用于使用llama.cpp推理引擎的用户。
+
 ## 特性描述
 
 llama-CPP优化补丁基于官方llama.cpp（commit `3ac67535c86`）。本优化面向**鲲鹏950处理器/鲲鹏920新型号处理器**，利用ARM NEON/SVE-256/i8mm指令集，聚焦llama.cpp推理引擎CPU后端的矩阵乘法与注意力（SDPA）算子，覆盖FP16、FP32、Q8_0三种数据类型的矩阵乘法以及融合注意力计算。整体不修改上层API与计算图结构，通过GGML CPU Backend的`type_traits`回调注册机制替换底层kernel，保证与非优化路径完全兼容。优化补丁基于llama.cpp的计算图调度机制，在GGML CPU Backend中注入自研高性能kernel，覆盖FP16、FP32、Q8_0三种数据类型的矩阵乘法以及融合SDPA（注意力）运算。
@@ -29,7 +31,7 @@ Embedding模型在权重为F16时，矩阵乘法主要发生在prefill阶段，�
 2. 预加载前64个元素到ax0..ax7/ay0..ay7。
 3. 主循环运算命令如下。
 
-   ```bash
+   ```c
     (i=64; i<np; i+=64):
      acc[k] += ax[k] * ay[k]        
      ax[k] = vld1q_f16(&x[i+k*8])   
@@ -84,7 +86,7 @@ Q8_0优化是性能提升最大的模块。核心思路是将A、B矩阵的`bloc
 
 Q8_0每个block包含32个int8量化值与1个fp16 scale，两个block做点积，计算公式如下。
 
-``` bash
+```text
 Σk (da×qa[k]) × (db×qb[k]) = (da×db) × Σk qa[k]×qb[k]
 
 int32_sum = Σ qa × qb            # SMMLA 计算
@@ -195,7 +197,7 @@ void ggml_compute_forward_fused_cpp_sdpa_ext(const struct ggml_compute_params * 
 
 ### 编译选项
 
-- fused SDPA编译（推荐，用于开启fused SDPA路径）
+- Fused SDPA编译（推荐，用于开启Fused SDPA路径）
 
    ```bash
    -march=armv8.6-a+dotprod+i8mm+sve -O3 -funroll-loops
