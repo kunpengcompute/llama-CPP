@@ -161,17 +161,17 @@ Total Test time (real) =   0.60 sec
 
 - ctest --test-dir build-delivery -R test-sdpa-f16q80-opt。
 
-```output
-    Start 29: test-sdpa-f16q80-opt
-1/1 Test #29: test-sdpa-f16q80-opt .............   Passed    0.62 sec
+    ```output
+        Start 29: test-sdpa-f16q80-opt
+    1/1 Test #29: test-sdpa-f16q80-opt .............   Passed    0.62 sec
 
-100% tests passed, 0 tests failed out of 1
+    100% tests passed, 0 tests failed out of 1
 
-Label Time Summary:
-fused-sdpa    =   0.62 sec*proc (1 test)
+    Label Time Summary:
+    fused-sdpa    =   0.62 sec*proc (1 test)
 
-Total Test time (real) =   0.62 sec
-```
+    Total Test time (real) =   0.62 sec
+    ```
 
 ## 修订记录
 
