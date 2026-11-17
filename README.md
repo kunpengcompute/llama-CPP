@@ -86,7 +86,7 @@ llama-CPP版本说明，请参见《[版本说明书](./docs/zh/release_notes.md
 ## 许可证书
 
 本项目采用Apache License 2.0，详见[LICENSE](./LICENSE)文件。
-本项目文档适用CC-BY 4.0许可证，具体请参见[CC-BY](./CC-BY)文件。
+本项目文档适用CC-BY 4.0许可证，具体请参见[LICENSE](./docs/LICENSE)文件。
 
 ## 致谢
 
