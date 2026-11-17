@@ -110,7 +110,7 @@ Outer tile M=128×N=64，K tile=2048，Micro tile 8×8。
 2. 按M分块：每次最多处理128行A。
 3. 按K分块：每次最多处理2048个K。
 4. 打包A panel（按2行/组）。
-5. 按N分块：每次最多处理6行B。
+5. 按N分块：每次最多处理64行B。
 6. 打包B panel（按4行/组）。
 7. 执行micro-kernel（`matmul_q8_0_mmla_8x8_b_micro_spack_neon`）。
    - 每次处理一个8×8 C tile（拆成上/下半4×8）。
