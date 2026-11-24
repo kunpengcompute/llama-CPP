@@ -1,13 +1,15 @@
 # 算子优化单元测试指南
 
+本文档介绍算子优化单元测试的验证方法，说明`tests/test-sdpa-f16q80-opt`如何以合成数据验证融合注意力与GEMM两条推理路径及FP16/Q8_0 NEON算子内核是否被实际执行，适用于需要在ARM环境确认ggml算子正确性的开发者。
+
 ## 测试介绍
 
 `tests/test-sdpa-f16q80-opt`是基于合成（mock）数据的正确性单元测试，用于验证两条推理路径。
 
 | 路径 | ggml算子 |
 | ------ | ----------- |
-| 融合注意力（SDPA） | `GGML_OP_FUSED_CPP_SDPA_EXT`（`ggml_fused_cpp_sdpa_ext`） |
-| 矩阵乘（GEMM） | `ggml_mul_mat`（F32/F16/Q8_0权重） |
+| 融合注意力（SDPA） | GGML_OP_FUSED_CPP_SDPA_EXT（ggml_fused_cpp_sdpa_ext） |
+| 矩阵乘（GEMM） | ggml_mul_mat （F32/F16/Q8_0权重） |
 
 测试不依赖模型文件或任何外部输入：进程内生成合成张量，经真实ggml CPU计算图执行端到端推理，并与C++数学参考实现比对。
 
@@ -57,16 +59,20 @@ q8_0   1024    8 4096  ffn_down（bge-m3）-> Q8_0 NEON GEMM
 
 | 路径 | 涉及函数 |
 | ------ | ---------- |
-| F16 GEMM（NEON） | `matmul_outer_packA_b_g_b16` -&gt; `matmul_outer_8x16_b_micro_packA_f16` / `matmul_outer_4x16_b_micro_packA_f16`；leftover走`ggml_matmul_f16_4x4_kernel` |
+| FP16 GEMM（NEON） | `matmul_outer_packA_b_g_b16` -&gt; `matmul_outer_8x16_b_micro_packA_f16` / `matmul_outer_4x16_b_micro_packA_f16`；leftover走`ggml_matmul_f16_4x4_kernel` |
 | Q8_0 GEMM（NEON） | `matmul_q8_0_mmla_spack_b_g` -&gt; `matmul_q8_0_mmla_8x8_b_micro_spack_neon` / `matmul_q8_0_mmla_4x4_b_micro_spack_neon` |
-| F32 GEMM | `ggml_matmul_f32_4x4_kernel` |
+| F32 GEMM | ggml_matmul_f32_4x4_kernel |
 | 融合 SDPA | `ggml_compute_forward_fused_cpp_sdpa_ext` -&gt; `fused_cpp_sdpa_flash2_neon_l3kv_packqkv_pbf16pv_fp32_llamacpp` / `..._mask_f16` / `..._mask_f32` |
 
 > ![表示说明的图片](./public_sys-resources/icon-note.gif)**说明**：`f16`与`q8_0`会命中上述NEON GEMM加速内核；`f32`作为参考基线对照。
 
 ## 测试原理
 
-测试用带种子的伪随机函数生成可复现的合成数据，将数据写入ggml张量，构建计算图并在CPU后端执行。再由C++参考实现计算期望结果，最后以归一化均方误差（NMSE，`nmse(a, b) = Σ(a - b)² / Σa²`）判定结果是否正确。判定阈值如下：fused SDPA `NMSE < 1e-4`；GEMM按权重类型区分，F32/Q8_0 `NMSE < 1e-4`，F16 `NMSE < 5e-3`（FP16累加精度随K增大而降低，故F16阈值放宽）。
+测试用带种子的伪随机函数生成可复现的合成数据，将数据写入ggml张量，构建计算图并在CPU后端执行。再由C++参考实现计算期望结果，最后以归一化均方误差`(NMSE，nmse(a, b) = Σ(a - b)² / Σa²)`判定结果是否正确。
+判定阈值如下：
+
+- 对于融合 SDPA、F32 GEMM 和 Q8_0 GEMM， `NMSE` 应小于 `1e-4`。
+- 对于F16 GEMM，`NMSE` 应小于 `5e-3`（F16 GEMM累加精度随K增大而降低，故F16 GEMM阈值放宽）。
 
 ### SDPA参考
 
@@ -78,7 +84,7 @@ q8_0   1024    8 4096  ffn_down（bge-m3）-> Q8_0 NEON GEMM
 
 1. `reference_matmul()`复现`ggml_mul_mat`约定。
 
-   ```bash
+   ```text
    out[i][j] = Σ_k w[i][k] · act[j][k]
    ```
 
@@ -111,7 +117,7 @@ ctest --test-dir build-delivery -R test-sdpa-f16q80-opt
 
 - build-delivery/bin/test-sdpa-f16q80-opt。
 
-``` text
+```output
 === fused SDPA (GGML_OP_FUSED_CPP_SDPA_EXT) ===
   SDPA B=1 H=2 L=8 S=8 D=32 DV=32 mask=0 NMSE=6.010e-11 ok
   SDPA B=1 H=2 L=8 S=8 D=32 DV=32 mask=1 NMSE=7.238e-11 ok
@@ -141,7 +147,7 @@ ctest --test-dir build-delivery -R test-sdpa-f16q80-opt
 
 - ctest --test-dir build-delivery -L fused-sdpa。
 
-```text
+```output
     Start 29: test-sdpa-f16q80-opt
 1/1 Test #29: test-sdpa-f16q80-opt .............   Passed    0.59 sec
 
@@ -155,17 +161,17 @@ Total Test time (real) =   0.60 sec
 
 - ctest --test-dir build-delivery -R test-sdpa-f16q80-opt。
 
-```text
-    Start 29: test-sdpa-f16q80-opt
-1/1 Test #29: test-sdpa-f16q80-opt .............   Passed    0.62 sec
+    ```output
+        Start 29: test-sdpa-f16q80-opt
+    1/1 Test #29: test-sdpa-f16q80-opt .............   Passed    0.62 sec
 
-100% tests passed, 0 tests failed out of 1
+    100% tests passed, 0 tests failed out of 1
 
-Label Time Summary:
-fused-sdpa    =   0.62 sec*proc (1 test)
+    Label Time Summary:
+    fused-sdpa    =   0.62 sec*proc (1 test)
 
-Total Test time (real) =   0.62 sec
-```
+    Total Test time (real) =   0.62 sec
+    ```
 
 ## 修订记录
 

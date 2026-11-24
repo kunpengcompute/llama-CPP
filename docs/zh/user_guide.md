@@ -1,5 +1,7 @@
 # 基于llama.cpp的BGE模型调优用户指南
 
+本文档介绍基于llama.cpp的BGE模型调优，涵盖为官方llama.cpp合入优化补丁、编译、部署并运行bge-m3等Embedding模型的调优指导步骤，适用于在鲲鹏950处理器/鲲鹏920新型号处理器上进行Embedding模型推理调优的用户。
+
 ## 调优概述
 
 本文档基于鲲鹏950处理器/鲲鹏920新型号处理器，提供针对官方llama.cpp（commit `3ac67535c86`）合入优化补丁、编译、部署并运行bge-m3等Embedding模型的调优指导步骤。
@@ -9,7 +11,7 @@
 - 硬件平台：鲲鹏950处理器/鲲鹏920新型号处理器（NEON / SVE-256 / i8mm）。
 - 操作系统：openEuler 22.03 LTS SP3及以上版本。
 - 编译器：GCC/G++ 12.3.1或更新版本（需支持`armv8.6-a+dotprod+i8mm+sve`）。
-- 构建依赖：cmake >= 3.20、ninja（推荐）、git。
+- 构建依赖：cmake 3.20或更新版本、ninja（推荐）、git。
 - 模型选择：bge-m3、bge-small-zh-v1.5等Embedding模型（FP16/Q8_0 GGUF格式）。
 
 ## 适配优化补丁
